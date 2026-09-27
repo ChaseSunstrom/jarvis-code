@@ -175,13 +175,14 @@ Reply with ONLY a JSON object, no prose:
 }
 
 /** guidance follows the diagnosed cause: bad-check/env/flaky ask for a fixed or replaced verify command
- * (or a person to fix the environment), too-big asks for a split, missing-context asks for notes. */
+ * (or a person to fix the environment), too-big asks for a split, missing-context asks for notes, transient for nothing. */
 const REPLAN_GUIDANCE: Partial<Record<Cause, string>> = {
 	'bad-check': 'The verify command itself is broken, not the agent or the task size: reply with one task like the original, but with a fixed or replaced verify command. If a person must fix the environment instead, do not split it: reply {"tasks":[]}.',
 	env: 'This looks like the environment, not the agent or the task size: reply with one task like the original, but with a fixed or replaced verify command. If a person must fix the environment instead, do not split it: reply {"tasks":[]}.',
 	flaky: 'The check is flaky (a rerun passed): reply with one task like the original, but with a fixed or replaced verify command that is deterministic. If a person must fix the environment instead, do not split it: reply {"tasks":[]}.',
 	'too-big': 'The task was too big or mixed several changes: split it into 2-4 smaller tasks that together do what it had to do, each independently verifiable, in dependency order.',
 	'missing-context': 'The agent was missing facts it needed: reply with one task like the original, but with the missing facts added to its notes.',
+	transient: 'The agent could not reach its model (rate limit, overload or network): that is not the task, so do not split it: reply {"tasks":[]}.',
 };
 
 /** Asks a planner to split a task that could not be finished; an empty plan means it needs a person. */
@@ -344,6 +345,10 @@ export class Orchestrator extends EventEmitter {
 	private started = Date.now();
 	private goal?: string;
 	private error?: string;
+	/** Tasks closed in this run, for the final check. */
+	private closed: Task[] = [];
+	/** Checks that passed when their task closed and fail at the end of the run. */
+	private regressions: { cmd: string; task: string; title: string }[] = [];
 	paused = false;
 
 	constructor(
@@ -490,6 +495,11 @@ export class Orchestrator extends EventEmitter {
 				const command = this.source.name === 'store' && step ? ` → ${step}` : '';
 				lines.push(`- ${t.id} ${t.title} (${t.status}): ${note}${command}`);
 			}
+			lines.push('');
+		}
+		if (this.regressions.length) {
+			lines.push('## Regressions', '', 'These passed when their task closed and fail at the end of the run: a later task likely broke them.', '');
+			for (const r of this.regressions) lines.push(`- ${r.task} ${r.title}: \`${r.cmd}\``);
 			lines.push('');
 		}
 		lines.push(
@@ -756,6 +766,22 @@ export class Orchestrator extends EventEmitter {
 			await Promise.race([...active, sleep(250)]);
 		}
 		await Promise.all(active);
+		if (!this.stopped && this.config.verify.final && this.closed.length >= 2) await this.finalCheck();
+	}
+
+	/** Rerun each closed task's checks once the run is over: a later task may have broken one. Report only. */
+	private async finalCheck() {
+		const cmds = new Map<string, Task>();
+		for (const t of this.closed) for (const a of t.acs) if (a.verify && !cmds.has(a.verify)) cmds.set(a.verify, t);
+		for (const [cmd, t] of cmds) {
+			if (this.stopped) return;
+			// In the main tree, so one at a time with landing and preflight: two `npm test`s would share one build dir.
+			if ((await this.oneAtATime(() => shell(cmd, this.cwd, this.config.verify.timeoutSec))).ok) continue;
+			this.regressions.push({ cmd, task: t.id, title: t.title });
+			this.note('review', `Regression: ${t.id}'s check fails at the end of the run: ${cmd}`, { task: t.id });
+			this.alertAt = Date.now();
+		}
+		if (this.regressions.length) this.saveReport();
 	}
 
 	private async runTask(task: Task) {
@@ -777,6 +803,8 @@ export class Orchestrator extends EventEmitter {
 			pre = { pass, fail: baseline.length - pass };
 			this.note('info', `${task.id} preflight: ${pass} already pass, ${baseline.length - pass} fail before any change`, { task: task.id });
 		}
+		// Checks that all pass on the untouched tree prove nothing about an attempt that changed nothing.
+		const passedBefore = !!baseline?.every((c) => c.ok);
 		const routes = routesFor(this.config, 'worker');
 		const failed = new Set<string>();
 		let previous: string | undefined;
@@ -865,6 +893,8 @@ export class Orchestrator extends EventEmitter {
 						});
 				}
 				const passed = checked && !findings && !broke;
+				if (passed && !held && passedBefore && task.type !== 'RESEARCH' && before && (await snapshot(where, wt ? LINKS : [])) === before)
+					held = 'its checks passed before any change and it changed nothing: they prove nothing, or the work was already done';
 				const learn = () => {
 					this.learnRoute(route, passed);
 					const off = this.learning.recordKind(route.id, task.type, passed);
@@ -889,6 +919,7 @@ export class Orchestrator extends EventEmitter {
 					learn();
 					record(true);
 					const r = await this.source.close(task, checks, `jarvis-code: ${route.id}, attempt ${attempt}, ${checks.length} check(s) passed`);
+					if (r.closed) this.closed.push(task);
 					view.status = r.closed ? 'done' : 'review';
 					view.note = r.closed ? out.summary.split('\n')[0]?.slice(0, 200) : r.message;
 					this.note(r.closed ? 'done' : 'review', `${task.id} ${r.closed ? 'done' : 'passed, needs review'}: ${task.title}`, {
@@ -946,8 +977,13 @@ export class Orchestrator extends EventEmitter {
 					if (cmd) broken.add(cmd);
 					break;
 				}
-				// Flaky: the route isn't charged either, but attempts keep going for the next one.
-				if (cause?.cause !== 'flaky') learn();
+				// Flaky or transient: the route isn't charged either, but attempts keep going for the next one.
+				if (cause?.cause !== 'flaky' && cause?.cause !== 'transient') learn();
+				// ponytail: fixed backoff that a stop waits out; add a config key (and an abort) if needed.
+				if (cause?.cause === 'transient' && attempt < this.config.maxAttempts) {
+					await sleep(15_000 * attempt);
+					if (this.stopped) break;
+				}
 			} finally {
 				await wt?.remove();
 			}

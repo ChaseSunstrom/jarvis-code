@@ -40,8 +40,11 @@ export interface Config {
 	strategy: 'priority' | 'best' | 'escalate';
 	maxAttempts: number;
 	maxParallel: number;
-	/** `preflight`: before the first attempt, run every AC's verify once on the untouched tree, so the worker knows what already passes. */
-	verify: { timeoutSec: number; preflight: boolean };
+	/**
+	 * `preflight`: before the first attempt, run every AC's verify once on the untouched tree, so the worker knows what already passes.
+	 * `final`: after the last task, rerun the verify commands of the tasks closed in this run and report any that now fail.
+	 */
+	verify: { timeoutSec: number; preflight: boolean; final: boolean };
 	ui: {
 		showDiffs: boolean;
 		showTools: boolean;
@@ -111,7 +114,7 @@ export const DEFAULTS: Config = {
 	strategy: 'priority',
 	maxAttempts: 3,
 	maxParallel: 1,
-	verify: { timeoutSec: 600, preflight: true },
+	verify: { timeoutSec: 600, preflight: true, final: false },
 	ui: {
 		showDiffs: false,
 		showTools: false,

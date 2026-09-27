@@ -336,15 +336,20 @@ export class Project {
 	/** How often each tier passed on its first attempt, over tasks that have had one: sizing advice for the planner. */
 	firstTry(): string | undefined {
 		const by = new Map<string, [number, number]>();
+		const causes = new Map<string, number>();
 		for (const t of this.tasks()) {
 			if (!t.attempts.length) continue;
 			const [ok, n] = by.get(t.tier) ?? [0, 0];
 			by.set(t.tier, [ok + (t.attempts[0].ok ? 1 : 0), n + 1]);
+			for (const a of t.attempts) if (!a.ok && a.cause) causes.set(a.cause, (causes.get(a.cause) ?? 0) + 1);
 		}
 		// S, M, L first; any other tier after them.
 		const rank = (tier: string) => ['S', 'M', 'L', tier].indexOf(tier);
 		const parts = [...by].sort(([a], [b]) => rank(a) - rank(b) || a.localeCompare(b)).map(([tier, [ok, n]]) => `${tier}: ${ok} of ${n}`);
-		return parts.length ? `${parts[0]} passed on the first attempt${parts.slice(1).map((x) => `; ${x}`).join('')}` : undefined;
+		if (!parts.length) return undefined;
+		// Why tasks failed tells the planner more than how often: too-big means split finer.
+		const top = [...causes].sort(([, a], [, b]) => b - a).slice(0, 4).map(([cause, n]) => `${cause} ${n}`);
+		return `${parts[0]} passed on the first attempt${parts.slice(1).map((x) => `; ${x}`).join('')}${top.length ? `; failed attempts by cause: ${top.join(', ')}` : ''}`;
 	}
 
 	log(event: Record<string, unknown>): void {

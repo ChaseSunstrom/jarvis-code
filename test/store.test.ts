@@ -226,3 +226,12 @@ test('store: first-try rate by tier reaches the planner', () => {
 	assert.match(contextPack(tmp('cwd'), { sizing, workers: ['claude'] }), /How tasks here went, by tier: S: 3 of 4 passed on the first attempt; M: 0 of 1\n\nWorkers available/);
 	assert.doesNotMatch(contextPack(tmp('cwd'), { workers: ['claude'] }), /How tasks here went/);
 });
+
+test('store: failure causes of failed attempts reach the planner, most common first', () => {
+	const p = new Project(tmp('proj'), tmp('store'));
+	p.add([{ title: 'a' }, { title: 'b' }]);
+	const fail = (cause?: string) => ({ at: 'x', route: 'r', ok: false, cause });
+	p.update('T-0001', (t) => (t.attempts = [fail('agent'), fail('too-big'), { at: 'x', route: 'r', ok: true }]));
+	p.update('T-0002', (t) => (t.attempts = [fail('too-big'), fail()]));
+	assert.equal(p.firstTry(), 'S: 0 of 2 passed on the first attempt; failed attempts by cause: too-big 2, agent 1');
+});

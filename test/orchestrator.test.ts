@@ -644,6 +644,63 @@ test('notify and report: the notify command gets each block and the digest; the 
 	assert.match(report, /- T-0002 Task 2 \(blocked\): check failed: grep -q never out\/t2\.done \[agent: [^\n]+\] → .*jarvis-code task retry T-0002/);
 });
 
+test('vacuous pass: checks that passed before any change, on an attempt that changed nothing, hold for review', async () => {
+	const cwd = tmp('store-repo');
+	execFileSync('git', ['init', '-q'], { cwd });
+	writeFileSync(join(cwd, 'seed.txt'), 'seed\n');
+	// The demo worker only writes `test -f` paths, so this task leaves the tree as it was.
+	const { config, learning } = setup(
+		{ workers: ['claude:claude-fable-5-1'], planning: { mode: 'direct' }, maxAttempts: 1 },
+		plan(1, () => 'test -e seed.txt').map((t) => ({ ...t, type: 'FEATURE' })),
+	);
+	const project = new Project(cwd, tmp('store'));
+	const o = new Orchestrator(config, new StoreSource(project, cwd, 60), learning, cwd);
+	await o.run('one thing');
+	const t = project.get('T-0001')!;
+	assert.equal(t.status, 'review');
+	assert.match(t.reason ?? '', /passed before any change/);
+});
+
+test('diagnosis: a transient agent failure (overload) is recorded as transient, and the route is not charged', async () => {
+	const cwd = tmp('store-repo');
+	// maxAttempts 1: no second attempt, so no backoff sleep.
+	const { config, learning } = setup(
+		{
+			agents: { busy: { kind: 'generic', enabled: true, bin: process.execPath, args: ['-e', 'console.error("API Error: 529 Overloaded"); process.exit(1)'], models: [] } },
+			workers: ['busy'],
+			planning: { mode: 'direct' },
+			maxAttempts: 1,
+			replan: false,
+		},
+		plan(1),
+	);
+	const project = new Project(cwd, tmp('store'));
+	const o = new Orchestrator(config, new StoreSource(project, cwd, 60), learning, cwd);
+	await o.run('one thing');
+	const t = project.get('T-0001')!;
+	assert.deepEqual(t.attempts.map((a) => a.cause), ['transient']);
+	assert.equal(learning.data.routes.busy?.runs ?? 0, 0);
+	assert.deepEqual(learning.data.kinds, {});
+});
+
+test('final check: a check a later task broke is reported under Regressions, only when verify.final is on', async () => {
+	// The demo worker writes out/tN.done, so t1's check passes when it closes and fails once t2 has run.
+	const planned = plan(2, (i) => (i === 1 ? 'test -f out/t1.done && test ! -e out/t2.done' : 'test -f out/t2.done'));
+	const runWith = async (over: object) => {
+		const cwd = tmp('store-repo');
+		const { config, learning } = setup({ workers: ['claude:claude-fable-5-1'], planning: { mode: 'direct' }, ...over }, planned);
+		const o = new Orchestrator(config, new StoreSource(new Project(cwd, tmp('store')), cwd, 60), learning, cwd);
+		assert.deepEqual(await o.run('two things'), { done: 2, blocked: 0, review: 0 });
+		return readFileSync(o.reportPath!, 'utf8');
+	};
+	const report = await runWith({ verify: { final: true } });
+	assert.match(report, /## Regressions/);
+	assert.ok(report.includes('- T-0001 Task 1: `test -f out/t1.done && test ! -e out/t2.done`'), report);
+	assert.ok(!report.includes('test -f out/t2.done`'), 't2 still passes');
+	assert.ok(report.indexOf('## Regressions') < report.indexOf('| task |'));
+	assert.doesNotMatch(await runWith({}), /## Regressions/);
+});
+
 test('report: the report is kept current during the run, in one file', async () => {
 	const cwd = tmp('store-repo');
 	const { config, learning } = setup(

@@ -14,7 +14,7 @@ export interface Pack {
 	lessons?: string[];
 	/** Worker routes and how they have done here. */
 	workers?: string[];
-	/** Project.firstTry(): how often each tier passed on its first attempt. */
+	/** Project.firstTry(): how often each tier passed on its first attempt, and why failed attempts failed. */
 	sizing?: string;
 }
 
@@ -44,6 +44,39 @@ function commands(cwd: string): string[] {
 	return out;
 }
 
+/** The first conventions file the repository has, and its opening. */
+function conventions(cwd: string): { file: string; text: string } | undefined {
+	for (const file of ['CLAUDE.md', 'AGENTS.md', 'CONTRIBUTING.md', '.github/CONTRIBUTING.md']) {
+		try {
+			const text = readFileSync(join(cwd, file), 'utf8').slice(0, 1500).trim();
+			if (text) return { file, text };
+		} catch {
+			/* not there */
+		}
+	}
+	return undefined;
+}
+
+/** Tracked files counted per directory, two levels deep: 'src/ 23 · src/agents/ 6 · test/ 18'. */
+function directories(cwd: string): string | undefined {
+	let files: string[];
+	try {
+		files = execFileSync('git', ['ls-files', '-z'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000, maxBuffer: 64 << 20 }).split('\0');
+	} catch {
+		return undefined;
+	}
+	const counts = new Map<string, number>();
+	for (const f of files) {
+		const dirs = f.split('/').slice(0, -1);
+		// Top-level files are already listed; committed build output and vendored deps are noise.
+		if (!dirs.length || dirs.some((d) => SKIP.has(d))) continue;
+		const key = `${dirs.slice(0, 2).join('/')}/`;
+		counts.set(key, (counts.get(key) ?? 0) + 1);
+	}
+	const out = [...counts].sort(([a], [b]) => a.localeCompare(b)).map(([d, n]) => `${d} ${n}`).join(' · ');
+	return out ? out.slice(0, 1500) : undefined;
+}
+
 export function contextPack(cwd: string, pack: Pack = {}): string {
 	const parts: string[] = [];
 	try {
@@ -69,6 +102,11 @@ export function contextPack(cwd: string, pack: Pack = {}): string {
 	if (pack.lessons?.length) parts.push(`Lessons earlier workers left here:\n${pack.lessons.map((l) => `- ${l}`).join('\n')}`);
 	if (pack.sizing) parts.push(`How tasks here went, by tier: ${pack.sizing}`);
 	if (pack.workers?.length) parts.push(`Workers available (size tasks for them):\n${pack.workers.map((w) => `- ${w}`).join('\n')}`);
+	// Last, so the size limit below trims these before anything above.
+	const conv = conventions(cwd);
+	if (conv) parts.push(`Conventions (${conv.file}, first lines):\n${conv.text}`);
+	const dirs = directories(cwd);
+	if (dirs) parts.push(`Files by directory (git ls-files):\n${dirs}`);
 	// The repository is not trusted text: no escape sequences, and a hard size limit.
 	return parts.length ? clean(`Repository facts (gathered by jarvis-code):\n\n${parts.join('\n\n')}`).slice(0, 6000) : '';
 }
@@ -198,6 +236,14 @@ export function validatePlan(plan: PlannedTask[], cwd?: string): string[] {
 	const problems: string[] = [];
 	const keys = new Set(plan.map((t, i) => t.key ?? `t${i + 1}`));
 	if (plan.length > 25) problems.push(`${plan.length} tasks: group them into at most 25`);
+	// A made-up script only fails once a worker attempt is spent on it, as bad-check.
+	let scripts: string[] | undefined;
+	if (cwd)
+		try {
+			scripts = Object.keys(JSON.parse(readFileSync(join(cwd, 'package.json'), 'utf8')).scripts ?? {});
+		} catch {
+			/* no package.json */
+		}
 	for (const [i, t] of plan.entries()) {
 		const name = `${t.key ?? `t${i + 1}`} "${t.title}"`;
 		if (!t.acs?.some((a) => a.verify?.trim())) problems.push(`${name} has no verify command: give each criterion a shell command that exits 0 only when it holds`);
@@ -218,6 +264,9 @@ export function validatePlan(plan: PlannedTask[], cwd?: string): string[] {
 			if (!a.verify) continue;
 			if (dangerous(a.verify)) problems.push(`${name} has a verify command jarvis-code will not run (it escalates, wipes, downloads and executes, or publishes): ${a.verify}`);
 			for (const p of verifyProblems(a.verify)) problems.push(`${name}: ${p}`);
+			if (scripts && !files.includes('package.json'))
+				for (const [, s] of a.verify.matchAll(/\b(?:npm|pnpm|yarn)\s+run(?:-script)?\s+([\w:.@/-]+)/g))
+					if (!scripts.includes(s)) problems.push(`${name} runs "npm run ${s}", but package.json has no "${s}" script (it has: ${scripts.slice(0, 12).join(', ') || 'none'})`);
 			const norm = a.verify.trim().replace(/\s+/g, ' ');
 			if (seen.has(norm)) problems.push(`${name} has two criteria with the same verify command "${a.verify}": give each criterion its own check, or drop the duplicate`);
 			seen.add(norm);

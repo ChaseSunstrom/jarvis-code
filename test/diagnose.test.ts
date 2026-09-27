@@ -28,6 +28,21 @@ test('diagnose: each failure gets a cause', () => {
 	assert.equal(diagnose({ checks: [fail('npm test')], summary: '\nFirst line.\nSecond line.' }).why, 'First line.');
 });
 
+test('diagnose: transient model and network failures before any check ran', () => {
+	for (const error of ['API Error: 529 Overloaded', 'rate_limit_error', 'read ECONNRESET', 'connect ETIMEDOUT 1.2.3.4:443', 'getaddrinfo EAI_AGAIN api.example.com', 'socket hang up', 'Network error', 'HTTP 429 Too Many Requests', 'Rate limit exceeded']) {
+		assert.equal(diagnose({ checks: [], summary: '', error }).cause, 'transient', error);
+	}
+	assert.equal(diagnose({ checks: [], summary: 'server overloaded, gave up' }).cause, 'transient');
+	// A check that ran and printed 429 is the task failing, not the agent losing its model.
+	assert.equal(diagnose({ checks: [fail('npm test', 1, 'expected 200, got 429')], summary: 'it failed', error: 'status 429' }).cause, 'agent');
+	// Usage limits last for hours: the circuit breaker must see them, not a quick retry.
+	assert.equal(diagnose({ checks: [], summary: '', error: 'Claude AI usage limit reached (429)' }).cause, 'agent');
+	// Word-bounded: a port or id that merely contains 429 is not a status code.
+	assert.equal(diagnose({ checks: [], summary: 'listening on 14290' }).cause, 'agent');
+	// A plain time-out stays too-big; only ETIMEDOUT with no checks is the network.
+	assert.equal(diagnose({ checks: [], summary: 'stopped', error: 'timed out after 600s' }).cause, 'too-big');
+});
+
 test('diagnose: order beats a later match', () => {
 	// A rerun that passed wins even though the same failure also hit two routes.
 	const rerun = diagnose({ checks: [fail('npm test')], summary: 'BLOCKED: need creds', sameRoutes: 3, rerunPassed: true });

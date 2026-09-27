@@ -122,9 +122,12 @@ terminal. The exit code is 0 when every task closed and 1 when any are blocked o
    A failure is also named, and the name is appended to the reason wherever it is shown (the
    block, `notify`, the report): `bad-check` (the verify command itself doesn't exist), `env`
    (the same failure hit two routes), `flaky` (a rerun of the same attempt passed, so the route
-   isn't charged for it), `missing-context` (the agent asked a `BLOCKED:`/`NEEDS:` question),
-   `too-big` (some checks passed and others didn't, or it ran out of turns, time or context), or
-   `agent` (anything else).
+   isn't charged for it), `transient` (a rate limit, overload or network drop before any check
+   ran: the route isn't charged and the retry waits), `missing-context` (the agent asked a
+   `BLOCKED:`/`NEEDS:` question), `too-big` (some checks passed and others didn't, or it ran out
+   of turns, time or context), or `agent` (anything else). A task whose checks all passed before
+   any change, and whose attempt changed nothing, waits for your review instead of closing: its
+   checks prove nothing, or the work was already done.
 7. **Re-plan once.** A planner gets the blocked task and why it stopped, and may split it into
    2–4 smaller tasks that replace it (its dependents then wait on them). A split task is never
    split again. When the failure needs a person, the task stays blocked and its dependents
@@ -173,7 +176,9 @@ written:
 
 Both the prompt writer and the planner start from facts jarvis-code gathers itself: the
 top-level layout, the README's first lines, build and test scripts, recent commits, tasks already
-queued, lessons from earlier workers, and how each worker route has done. A goal can be a tagged
+queued, lessons from earlier workers, how each worker route has done, the opening of the
+repository's conventions file (`CLAUDE.md`, `AGENTS.md` or `CONTRIBUTING.md`), and a map of its
+tracked files by directory. A goal can be a tagged
 list: `FIX:`/`FEATURE:`/… lines become separate items, and `MUST:`, `NEVER:` and `DONE-WHEN:`
 lines become constraints every task has to respect. A plan whose tasks lack verify commands,
 use unknown types or tiers, or depend on tasks in a cycle goes back to its planner once with the
@@ -253,7 +258,7 @@ the defaults. Objects merge, arrays replace. `jarvis-code config init` writes a 
   "maxAttempts": 3,
   "maxParallel": 1,                // >1 runs workers side by side, each in its own git worktree
   "worktrees": true,               // false: parallel workers share the one working tree
-  "verify": { "timeoutSec": 600, "preflight": true },  // preflight: run every criterion's check on the untouched tree first, so the worker knows what already passes
+  "verify": { "timeoutSec": 600, "preflight": true, "final": false },  // preflight: run every criterion's check on the untouched tree first, so the worker knows what already passes · final: after the last task, rerun the checks of every task closed in the run and report any that now fail
   "ui": { "showDiffs": false, "showTools": false, "showText": false, "reactor": "large", "reactorStyle": "blocks", "fps": 24, "reducedMotion": false },
   "learning": { "minSamples": 3, "disableBelow": 0.35, "cooldownMin": 1440, "decay": 0.9, "blockTools": true, "neverBlock": [] },
   "downgrade": {

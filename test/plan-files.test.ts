@@ -57,3 +57,22 @@ test('plan files: prompts ask for files and parsePlan keeps them as strings', ()
 	assert.deepEqual(parsePlan('{"tasks":[{"title":"A","files":["src/a.ts",3]}]}')?.[0].files, ['src/a.ts', '3']);
 	assert.equal(parsePlan('{"tasks":[{"title":"A","files":"src/a.ts"}]}')?.[0].files, undefined);
 });
+
+test('plan files: a verify command running an npm run script package.json lacks is flagged', () => {
+	const dir = tree();
+	try {
+		const v = (verify: string, files: string[] = []): PlannedTask => ({ key: 'a', title: 'Task', acs: [{ text: 'x', verify }], steps: [], files });
+		assert.deepEqual(validatePlan([v('npm run lint')], dir), [], 'no package.json, no check');
+		writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: { test: 'x', build: 'y' } }));
+		assert.match(validatePlan([v('npm run lint')], dir).join(), /runs "npm run lint", but package.json has no "lint" script \(it has: test, build\)/);
+		for (const cmd of ['pnpm run lint', 'yarn run lint', 'npm run-script lint', 'npm run build && npm run lint'])
+			assert.match(validatePlan([v(cmd)], dir).join(), /no "lint" script/, cmd);
+		assert.deepEqual(validatePlan([v('npm run build && npm test')], dir), []);
+		// the task adds the script itself
+		assert.deepEqual(validatePlan([v('npm run lint', ['package.json'])], dir), []);
+		// without a cwd nothing is read
+		assert.deepEqual(validatePlan([v('npm run lint')]), []);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});

@@ -1,6 +1,6 @@
 import type { Check } from './tasks.js';
 
-export type Cause = 'flaky' | 'bad-check' | 'env' | 'missing-context' | 'too-big' | 'agent';
+export type Cause = 'flaky' | 'bad-check' | 'env' | 'missing-context' | 'too-big' | 'agent' | 'transient';
 
 /** A limit's exit code is 126/127 for a bare command (e.g. `jq`); a missing `./script.sh` is the agent's own miss. */
 const bareWord = (cmd: string): boolean => {
@@ -9,11 +9,16 @@ const bareWord = (cmd: string): boolean => {
 };
 
 const LIMIT = /turn limit|max(?:imum)? turns|time limit|timed? ?out|context limit|context window|ran out of (?:turns|time)/i;
+/** The agent lost its model: rate limit, overload or network. Usage limits last hours, so they stay with the circuit breaker. */
+const TRANSIENT = /\b(?:429|529)\b|overloaded|rate[ _-]?limit|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up|network error/i;
 const NEEDS_INFO = /^(BLOCKED|NEEDS)[:\s].+$/im;
 
 /** Names why an attempt failed, from its checks and summary. Pure: no I/O, no wiring here. */
 export function diagnose(a: { checks: Check[]; summary: string; error?: string; sameRoutes?: number; rerunPassed?: boolean }): { cause: Cause; why: string; check?: Check } {
 	if (a.rerunPassed) return { cause: 'flaky', why: 'a rerun of the same attempt passed' };
+	// Only with no checks run: a check that prints 429 is the task failing, not the agent.
+	const said = `${a.summary}\n${a.error ?? ''}`;
+	if (a.checks.length === 0 && TRANSIENT.test(said) && !/usage limit/i.test(said)) return { cause: 'transient', why: 'the agent could not reach its model (rate limit, overload or network): not the task or the route' };
 
 	const badCheck = a.checks.find((c) => !c.ok && (c.code === 126 || c.code === 127) && bareWord(c.cmd));
 	if (badCheck) return { cause: 'bad-check', why: `${badCheck.cmd.trim().split(/\s+/)[0]} exited ${badCheck.code}: command not found`, check: badCheck };
