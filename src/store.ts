@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 import { paths } from './config.js';
+import { recordIntent } from './intent.js';
 
 /**
  * jarvis-code's own task state: one directory per project under the state dir, one JSON
@@ -10,6 +11,7 @@ import { paths } from './config.js';
  *   <state>/projects/<slug>/project.json
  *   <state>/projects/<slug>/tasks/T-0001.json
  *   <state>/projects/<slug>/ledger.jsonl       every change, one event per line
+ *   <state>/projects/<slug>/goals.json          goals queued behind the current run
  *   <state>/projects/<slug>/decisions.jsonl
  *   <state>/projects/<slug>/research/<name>.md  plans, brainstorms, prompts
  */
@@ -44,6 +46,8 @@ export interface Attempt {
 	costUsd?: number;
 	/** Checks that passed/failed on the untouched tree, first attempt only: those passes prove nothing about the change. */
 	preflight?: { pass: number; fail: number };
+	/** The file (a research note) holding what this attempt changed; none outside a git repo or when it changed nothing. */
+	patch?: string;
 }
 
 export interface StoredTask {
@@ -64,7 +68,7 @@ export interface StoredTask {
 	source: 'user' | 'plan' | 'replan' | 'followup';
 	/** Why it is blocked, deferred or waiting for review. */
 	reason?: string;
-	/** What a person said when they sent this task back: guidance for the next worker. */
+	/** What a person said about this task (sending it back, or a note mid-run): guidance for the next worker. */
 	hint?: string;
 	attempts: Attempt[];
 	evidence: Evidence[];
@@ -87,6 +91,12 @@ export interface NewTask {
 	brief?: string;
 	notes?: string;
 	files?: string[];
+}
+
+/** A goal sent while the project's run was going, to run after it. */
+export interface QueuedGoal {
+	goal: string;
+	at: string;
 }
 
 export interface ProjectMeta {
@@ -352,6 +362,44 @@ export class Project {
 		return `${parts[0]} passed on the first attempt${parts.slice(1).map((x) => `; ${x}`).join('')}${top.length ? `; failed attempts by cause: ${top.join(', ')}` : ''}`;
 	}
 
+	/** Goals waiting for the project's run to end, oldest first. A missing or bad file is an empty queue. */
+	goals(): QueuedGoal[] {
+		const q = readJson<QueuedGoal[]>(join(this.dir, 'goals.json'));
+		return Array.isArray(q) ? q.filter((g) => typeof g?.goal === 'string') : [];
+	}
+
+	// ponytail: read-modify-write without a lock, two processes queueing at the same instant can lose one; lock the file if that shows up.
+	private saveGoals(q: QueuedGoal[]): void {
+		writeAtomic(join(this.dir, 'goals.json'), JSON.stringify(q, null, 2));
+	}
+
+	/** Queue a goal; returns its 1-based position. An identical queued goal is not added twice. */
+	enqueue(goal: string): number {
+		const q = this.goals();
+		const g = goal.trim();
+		const at = q.findIndex((x) => x.goal === g);
+		if (at >= 0) return at + 1;
+		q.push({ goal: g, at: now() });
+		this.saveGoals(q);
+		this.log({ event: 'queue', goal: g, n: q.length });
+		return q.length;
+	}
+
+	/** Remove and return queued goal n (1-based); undefined when there is none. */
+	unqueue(n: number): QueuedGoal | undefined {
+		const q = this.goals();
+		if (!Number.isInteger(n) || n < 1 || n > q.length) return undefined;
+		const [g] = q.splice(n - 1, 1);
+		this.saveGoals(q);
+		this.log({ event: 'unqueue', goal: g.goal, n });
+		return g;
+	}
+
+	/** Take the oldest queued goal off the queue. */
+	nextGoal(): string | undefined {
+		return this.unqueue(1)?.goal;
+	}
+
 	log(event: Record<string, unknown>): void {
 		appendFileSync(join(this.dir, 'ledger.jsonl'), JSON.stringify({ at: now(), ...event }) + '\n');
 	}
@@ -474,15 +522,16 @@ export function nextStep(t: Pick<StoredTask, 'id' | 'status' | 'reason'>): strin
 
 const decisionSuffix = (verb: Decision) => (verb === 'approve' ? 'approved: done' : verb === 'retry' || verb === 'unblock' ? 'back in the queue' : DECISIONS[verb]);
 
-function applyDecision(p: Project, verb: Decision, t: StoredTask, why?: string): void {
+function applyDecision(p: Project, verb: Decision, t: StoredTask, why?: string, intent?: boolean): void {
 	if (verb === 'approve' && t.status !== 'review') throw new Error(`${t.id} is ${t.status}, not waiting for review`);
 	if ((verb === 'retry' || verb === 'unblock') && (t.status === 'planned' || t.status === 'active')) throw new Error(`${t.id} is already in the queue`);
 	if (verb === 'retry' || verb === 'unblock') p.update(t.id, (t) => (t.hint = why || undefined));
 	p.setStatus(t.id, DECISIONS[verb], why || (verb === 'approve' ? 'approved by hand' : undefined));
+	if (intent && (verb === 'drop' || verb === 'approve')) recordIntent({ kind: verb === 'drop' ? 'dropped' : 'accepted', text: t.title, project: p.meta.name });
 }
 
-/** A person's decision on a task, from the CLI or the cockpit. Returns what happened, or throws why not. */
-export function decideTask(p: Project, verb: Decision, id: string, why?: string): string {
+/** A person's decision on a task, from the CLI or the cockpit. Returns what happened, or throws why not. `intent` records drops and approvals in intent memory. */
+export function decideTask(p: Project, verb: Decision, id: string, why?: string, opts: { intent?: boolean } = {}): string {
 	const word = id.toLowerCase();
 	if ((BULK as readonly string[]).includes(word)) {
 		const matches = p.tasks().filter((t) => t.status === word);
@@ -490,7 +539,7 @@ export function decideTask(p: Project, verb: Decision, id: string, why?: string)
 		const errs: string[] = [];
 		for (const t of matches) {
 			try {
-				applyDecision(p, verb, t, why);
+				applyDecision(p, verb, t, why, opts.intent);
 				oks.push(t.id);
 			} catch (e) {
 				errs.push((e as Error).message);
@@ -501,7 +550,7 @@ export function decideTask(p: Project, verb: Decision, id: string, why?: string)
 	}
 	const t = p.get(id.toUpperCase());
 	if (!t) throw new Error(`no task ${id} in ${p.meta.name}`);
-	applyDecision(p, verb, t, why);
+	applyDecision(p, verb, t, why, opts.intent);
 	let msg = `${t.id} ${decisionSuffix(verb)}`;
 	if ((verb === 'retry' || verb === 'unblock') && !why) {
 		const last2 = t.attempts.slice(-2);

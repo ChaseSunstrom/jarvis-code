@@ -116,13 +116,15 @@ export interface Intake {
 	must: string[];
 	never: string[];
 	doneWhen: string[];
+	/** Route ids from `USING:` lines: this goal's run plans and works on them instead of the configured routes. */
+	using: string[];
 }
 
-const TAG = /^\s*(FIX|FEATURE|CLEAN|PERF|PERFORMANCE|SECURITY|RESEARCH|MUST|NEVER|DONE-WHEN)\s*:\s*(.+)$/i;
+const TAG = /^\s*(FIX|FEATURE|CLEAN|PERF|PERFORMANCE|SECURITY|RESEARCH|MUST|NEVER|DONE-WHEN|USING)\s*:\s*(.+)$/i;
 
-/** A goal written as a tagged list: `FIX: …` lines are items, `MUST:`/`NEVER:`/`DONE-WHEN:` constraints. */
+/** A goal written as a tagged list: `FIX: …` lines are items, `MUST:`/`NEVER:`/`DONE-WHEN:` constraints, `USING:` routes. */
 export function parseIntake(goal: string): Intake | undefined {
-	const out: Intake = { items: [], must: [], never: [], doneWhen: [] };
+	const out: Intake = { items: [], must: [], never: [], doneWhen: [], using: [] };
 	for (const line of goal.split('\n')) {
 		const m = line.match(TAG);
 		if (!m) continue;
@@ -131,9 +133,10 @@ export function parseIntake(goal: string): Intake | undefined {
 		if (tag === 'MUST') out.must.push(text);
 		else if (tag === 'NEVER') out.never.push(text);
 		else if (tag === 'DONE-WHEN') out.doneWhen.push(text);
+		else if (tag === 'USING') out.using.push(...text.split(/[\s,]+/).filter(Boolean));
 		else out.items.push({ type: tag === 'PERFORMANCE' ? 'PERF' : tag, text });
 	}
-	return out.items.length || out.must.length || out.never.length || out.doneWhen.length ? out : undefined;
+	return out.items.length || out.must.length || out.never.length || out.doneWhen.length || out.using.length ? out : undefined;
 }
 
 export function intakeText(i: Intake): string {

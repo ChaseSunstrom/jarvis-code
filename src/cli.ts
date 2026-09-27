@@ -6,9 +6,10 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { agentEnabled, DEFAULTS, loadConfig, merge, normalize, onPath, paths, trustProject, untrustProject, type Config } from './config.js';
+import { intentFile, intentSummary, resetIntent } from './intent.js';
 import { Learning, routesFor, score } from './learn.js';
 import { Orchestrator } from './orchestrator.js';
-import { improveGoal } from './pipeline.js';
+import { improveGoal, nextRound } from './pipeline.js';
 import { attachPlain } from './plain.js';
 import { install, installed, PLUGIN_DIR, ROOT, TARGETS, uninstall, type Target } from './plugin.js';
 import { RunManager, demoConfig, runDetached, stopElsewhere, type Run } from './runs.js';
@@ -24,7 +25,8 @@ Usage
   jarvis-code                     the cockpit: every project, runs, a prompt for goals and /commands
   jarvis-code "<goal>"            plan the goal into tasks, then work them (opens the cockpit on the run)
   jarvis-code work                work this project's open tasks, no planning
-  jarvis-code improve [focus]     find and make the most valuable improvements here (brainstormed first)
+  jarvis-code improve [focus]     find and make the most valuable improvements here (brainstormed first);
+                                  with --plain, rounds that each build on the last until one lands too little
   jarvis-code demo                simulated agents: see the TUI, learning and re-upgrades (no API calls)
   jarvis-code status              the queue, the agents and their learned health
   jarvis-code stop                end this project's background or CLI run
@@ -33,6 +35,7 @@ Usage
   jarvis-code task show|retry|defer|drop|approve ID|blocked|review [why]
   jarvis-code status --all [--json]   every project's queue (JSON for scripts)
   jarvis-code learn [reset [KEY]] what was learned about routes and tools; forget it
+  jarvis-code intent [reset]      what you asked for and turned down, across projects (redacted); forget it
   jarvis-code config [show|path|init [--project]|trust|untrust]
   jarvis-code plugin <install|uninstall|status> [claude|codex|opencode]
   jarvis-code doctor              check agents, plugin and terminal
@@ -49,6 +52,7 @@ Options
   --attempts N            attempts per task across routes (default 3)
   --budget USD            stop the run once it has cost this much (kills its workers)
   --max-minutes N         stop the run after N minutes
+  --rounds N --min K      improve: at most N rounds (default 3); a round landing under K tasks ends it (default 1)
   --show-diffs --show-tools --show-text   feed detail (off by default)
   --reactor large|small|off   --reduced-motion   --cwd DIR
   --fast                  demo: run at test speed
@@ -79,6 +83,8 @@ async function main(argv: string[]) {
 				attempts: { type: 'string' },
 				budget: { type: 'string' },
 				'max-minutes': { type: 'string' },
+				rounds: { type: 'string' },
+				min: { type: 'string' },
 				detach: { type: 'boolean' },
 				'show-diffs': { type: 'boolean' },
 				'show-tools': { type: 'boolean' },
@@ -110,6 +116,10 @@ async function main(argv: string[]) {
 		if (!Number.isInteger(n) || n < 1) die(`--${name} must be a positive integer`);
 		return n;
 	};
+	const whole = (v: string, name: string) => {
+		if (!/^\d+$/.test(v)) die(`--${name} must be a whole number, 0 or more`);
+		return Number(v);
+	};
 	const positive = (v: string, name: string) => {
 		const n = Number(v);
 		if (!(n > 0)) die(`--${name} must be a number above 0`);
@@ -123,6 +133,7 @@ async function main(argv: string[]) {
 		...(f.parallel && { maxParallel: int(f.parallel, 'parallel') }),
 		...(f.attempts && { maxAttempts: int(f.attempts, 'attempts') }),
 		...(f.planning && { planning: { mode: f.planning } }),
+		...((f.rounds !== undefined || f.min !== undefined) && { improve: { ...(f.rounds !== undefined && { rounds: int(f.rounds, 'rounds') }), ...(f.min !== undefined && { minLanded: whole(f.min, 'min') }) } }),
 		...((f.budget || f['max-minutes']) && { budget: { ...(f.budget && { usd: positive(f.budget, 'budget') }), ...(f['max-minutes'] && { minutes: positive(f['max-minutes'], 'max-minutes') }) } }),
 		ui: {
 			...(f['show-diffs'] && { showDiffs: true }),
@@ -155,9 +166,11 @@ async function main(argv: string[]) {
 		case 'tasks':
 			return tasksCmd(cwd, !!f.all);
 		case 'task':
-			return taskCmd(cwd, rest, { type: f.type, tier: f.tier, ac: f.ac });
+			return taskCmd(cwd, rest, { type: f.type, tier: f.tier, ac: f.ac, intent: config.intent });
 		case 'learn':
 			return learn(config, rest);
+		case 'intent':
+			return intentCmd(config, rest);
 		case 'config':
 			return configCmd(config, sources, cwd, rest, !!f.project);
 		case 'plugin':
@@ -167,11 +180,12 @@ async function main(argv: string[]) {
 		case 'help':
 			return say(HELP);
 		case 'improve': {
-			const goal = improveGoal(rest.join(' ') || undefined);
+			const focus = rest.join(' ') || undefined;
+			const goal = improveGoal(focus);
 			const deep = { planning: { mode: 'deep' } };
 			if (f.detach) return detach(cwd, argv, f.tasks);
 			if (tui) return cockpit(config, cwd, overrides, (m) => m.start(cwd, { goal, overrides: deep }));
-			return run(normalize(merge(config, deep)), cwd, goal, f.tasks);
+			return run(normalize(merge(config, deep)), cwd, goal, f.tasks, { focus });
 		}
 		case 'work':
 		case 'run':
@@ -230,20 +244,45 @@ function source(config: Config, cwd: string, kind: string | undefined): TaskSour
 	return new StoreSource(new Project(cwd), cwd, config.verify.timeoutSec);
 }
 
-async function run(config: Config, cwd: string, goal: string | undefined, tasks: string | undefined) {
+/** `improve`: after the first run, more rounds of improveGoal, each building on what the last closed, until nextRound ends them. */
+async function run(config: Config, cwd: string, goal: string | undefined, tasks: string | undefined, improve?: { focus?: string }) {
 	if (!goal && tasks === 'memory') die('nothing to work: the memory queue starts empty, give a goal');
 	const src = source(config, cwd, tasks);
 	// Workers load this package's plugin per session unless it is installed for good.
 	const pluginDir = installed.claude() ? undefined : PLUGIN_DIR;
-	const o = new Orchestrator(config, src, new Learning(config.learning), cwd, { pluginDir });
 	const project = src instanceof StoreSource ? src.project : undefined;
 	try {
 		project?.lock({ goal, log: process.env.JARVIS_CODE_LOG, by: 'cli' });
 	} catch (e) {
+		// A goal for a busy project waits for its run; `work` has nothing to wait with.
+		const held = project?.running();
+		if (goal && held) return say(`${tone('jarvis-code', 'accent')}: queued #${project!.enqueue(goal)} in ${project!.meta.name}: runs after the current run (pid ${held.pid})`);
 		die((e as Error).message, 1);
 	}
 	try {
-		process.exitCode = await drive(o, config, goal);
+		// Then the improve rounds and the goals queued while it ran, each with a fresh orchestrator, until one stops or fails.
+		let code = 0;
+		for (let next = goal, round = 1; ; round++) {
+			const o = new Orchestrator(config, src, new Learning(config.learning), cwd, { pluginDir });
+			code = Math.max(code, await drive(o, config, next));
+			const s = o.snapshot();
+			if (improve) {
+				const n = (st: string) => s.tasks.filter((t) => t.status === st);
+				const built = n('done').map((t) => t.title);
+				const { rounds, minLanded } = config.improve;
+				say(`${tone('jarvis-code', 'accent')}: improve round ${round}/${rounds}: ${built.length} landed, ${n('blocked').length} blocked, ${n('review').length} to review · $${s.cost.toFixed(2)}`);
+				const end = nextRound({ round, rounds, landed: built.length, minLanded, stopped: s.phase === 'stopped' || !!s.error });
+				if (!end) {
+					next = improveGoal(improve.focus, built);
+					continue;
+				}
+				const why = { stopped: s.error ? `the run failed: ${s.error}` : 'the run was stopped', dry: `it landed fewer than ${minLanded} task${minLanded === 1 ? '' : 's'}`, rounds: `all ${rounds} round${rounds === 1 ? '' : 's'} ran` }[end];
+				say(`${tone('jarvis-code', 'accent')}: improve ended after round ${round} (${end}): ${why}`);
+				improve = undefined;
+			}
+			if (s.phase === 'stopped' || s.error || !(next = project?.nextGoal())) break;
+		}
+		process.exitCode = code;
 	} finally {
 		project?.unlock();
 	}
@@ -276,6 +315,9 @@ async function drive(o: Orchestrator, config: Config, goal: string | undefined):
 	process.once('SIGINT', stop);
 	process.once('SIGTERM', stop);
 	const r = await done;
+	// Drained goals each drive a new orchestrator: don't pile up listeners for finished ones.
+	process.off('SIGINT', stop);
+	process.off('SIGTERM', stop);
 	end();
 	return r.blocked || r.review || o.snapshot().error ? 1 : 0;
 }
@@ -377,7 +419,7 @@ function tasksCmd(cwd: string, all: boolean) {
 	say(tone(`\n${s.planned + s.active} open · ${s.blocked} blocked · ${s.review} to review · ${s.deferred} deferred · ${s.done} done`, 'textDim'));
 }
 
-function taskCmd(cwd: string, args: string[], f: { type?: string; tier?: string; ac?: string[] }) {
+function taskCmd(cwd: string, args: string[], f: { type?: string; tier?: string; ac?: string[]; intent: boolean }) {
 	const [verb, id, ...why] = args;
 	if (verb === 'add') {
 		const title = args.slice(1).join(' ').trim();
@@ -414,7 +456,7 @@ function taskCmd(cwd: string, args: string[], f: { type?: string; tier?: string;
 		}
 		default:
 			try {
-				return say(decideTask(project, verb as Decision, id!, why.join(' ')));
+				return say(decideTask(project, verb as Decision, id!, why.join(' '), { intent: f.intent }));
 			} catch (e) {
 				die((e as Error).message, 1);
 			}
@@ -447,6 +489,16 @@ function learn(config: Config, args: string[]) {
 	say(tone('\nT O O L S', 'textDim') + '  (per orchestrating agent)');
 	if (!Object.keys(tools).length) say('  nothing yet');
 	for (const [k, st] of Object.entries(tools)) row(k.replace('|', ' › '), k, st);
+}
+
+function intentCmd(config: Config, args: string[]) {
+	if (args[0] === 'reset') {
+		resetIntent();
+		return say('forgot everything in intent memory');
+	}
+	if (args.length) die('usage: jarvis-code intent [reset]');
+	say(intentSummary() || 'nothing recorded yet');
+	say(tone(`\n${intentFile()}${config.intent ? '' : ' · off ("intent": false): nothing new is recorded'} · jarvis-code intent reset forgets it`, 'textDim'));
 }
 
 function configCmd(config: Config, sources: string[], cwd: string, args: string[], project: boolean) {

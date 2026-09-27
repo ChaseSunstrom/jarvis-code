@@ -170,15 +170,24 @@ export function parseRoute(id: string): Route {
 	return i < 0 ? { id, agent: id } : { id, agent: id.slice(0, i), model: id.slice(i + 1) };
 }
 
-/** The routes for a role, in preference order: the configured list, or every enabled agent × model. */
-export function routesFor(config: Config, role: 'planner' | 'worker', enabled = agentEnabled): Route[] {
-	const listed = role === 'planner' ? config.planner : config.workers;
-	const all = listed.length
-		? listed.map(parseRoute)
-		: Object.entries(config.agents).flatMap(([agent, a]) =>
-				a.models.length ? a.models.map((model) => ({ id: `${agent}:${model}`, agent, model })) : [{ id: agent, agent }],
-			);
-	return all.filter((r) => config.agents[r.agent] && enabled(config.agents[r.agent]));
+export type Role = 'promptWriter' | 'brainstorm' | 'critic' | 'planner' | 'reviewer' | 'worker';
+
+/**
+ * The routes for a role, in preference order, from the first of these levels that still has an
+ * enabled agent: `using` · routes[TYPE] (workers only) · routes[role] · the legacy planner/workers
+ * lists · routes.default · every enabled agent × model. So a bad override never leaves a role without one.
+ */
+export function routesFor(config: Config, role: Role, enabled = agentEnabled, opts: { type?: string; using?: string[] } = {}): Route[] {
+	const on = (r: Route) => !!config.agents[r.agent] && enabled(config.agents[r.agent]);
+	const legacy = role === 'worker' ? config.workers : role === 'brainstorm' || role === 'reviewer' ? [...new Set([...config.planner, ...config.workers])] : config.planner;
+	const levels = [opts.using, role === 'worker' && opts.type ? config.routes[opts.type.toUpperCase()] : undefined, config.routes[role === 'worker' ? 'workers' : role], legacy, config.routes.default];
+	for (const ids of levels) {
+		const routes = (ids ?? []).map(parseRoute).filter(on);
+		if (routes.length) return routes;
+	}
+	return Object.entries(config.agents)
+		.flatMap(([agent, a]) => (a.models.length ? a.models.map((model) => ({ id: `${agent}:${model}`, agent, model })) : [{ id: agent, agent }]))
+		.filter(on);
 }
 
 /** What a route is being chosen for: its task's type and tier, when it is a task. */

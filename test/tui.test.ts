@@ -16,6 +16,12 @@ import { Project, type StoredTask } from '../src/store.js';
 import { Cockpit, matchCommands } from '../src/tui/Cockpit.js';
 import { Feed, Header, Tasks } from '../src/tui/parts.js';
 import { Reports, TaskDetail, Workers } from '../src/tui/parts.js';
+import { clauseMark, kindMark, MARKS, statusMark } from '../src/tui/style.js';
+import { DepTree, Graph } from '../src/tui/graph.js';
+import { PAGER_MAX, pageLines, Pager } from '../src/tui/pager.js';
+import { c } from '../src/theme.js';
+import type { Snapshot } from '../src/orchestrator.js';
+import { sampleSnapshot } from './sample-snapshot.js';
 
 const demoAgent = fileURLToPath(new URL('../src/demo-agent.js', import.meta.url));
 const cli = fileURLToPath(new URL('../src/cli.js', import.meta.url));
@@ -148,7 +154,7 @@ test('a typed goal starts a run in the selected project; diffs and tool calls st
 	await sleep(300);
 	let f = frame(ui);
 	assert.match(f, /done: /, 'completions show');
-	assert.doesNotMatch(f, /› Bash|\+ const a/, 'diffs and tool calls are hidden by default');
+	assert.doesNotMatch(f, /tool +(Bash|Read)|\+ const a/, 'diffs and tool calls are hidden by default');
 	await type(ui, '/diffs');
 	ui.stdin.write('\r');
 	await sleep(60);
@@ -157,7 +163,8 @@ test('a typed goal starts a run in the selected project; diffs and tool calls st
 	await sleep(300);
 	f = frame(ui);
 	assert.match(f, /diffs · tools/);
-	assert.match(f, /› Bash|\+ const a/);
+	// The run ends with the coverage check's Read, after the last worker's Bash.
+	assert.match(f, /tool +(Bash|Read)|\+ const a/);
 });
 
 test('two projects run at once', async () => {
@@ -200,6 +207,21 @@ test('the agents panel fits its height: two rows each, then one, then a count', 
 	const many = rows(9, 6);
 	assert.equal(many.length, 6);
 	assert.match(many.at(-1)!, /… 5 more/);
+});
+
+test('workers status: each row shows its role, latest line and, once quiet, how long', () => {
+	const now = Date.now();
+	const w = (key: string, ago: number) => ({ key, task: key.replace('review:', ''), title: key, route: 'claude:m', phase: key.startsWith('review:') ? ('reviewing' as const) : ('running' as const), started: now - 300_000, lastAt: now - ago * 1000, tools: 1, last: `line ${ago}`, cost: 0 });
+	const ui = render(createElement(Workers, { workers: [w('T-0001', 10), w('review:T-0002', 60), w('planner', 200)], t: 0, height: 8 }));
+	const f = frame(ui).split('\n');
+	ui.unmount();
+	assert.match(f[1], /worker T-0001 claude:m/);
+	assert.doesNotMatch(f[1], /quiet/);
+	assert.match(f[2], /└ line 10/);
+	assert.match(f[3], /reviewer review T-0002 claude:m\s+quiet 1m00s/);
+	assert.match(f[4], /└ line 60/);
+	assert.match(f[5], /planner planner claude:m\s+quiet 3m20s/);
+	assert.match(f[6], /└ line 200/);
 });
 
 test('reports pane: lists reports and says when there are none', () => {
@@ -531,6 +553,32 @@ test('scroll: the feed pages back and returns to live; the queue scrolls with it
 	assert.match(f, /… \d+ more/);
 });
 
+test('icons: text tags by default, a glyph table on ui.icons "glyph", no emoji in either', () => {
+	const emoji = /\p{Extended_Pictographic}|\p{Emoji_Presentation}/u;
+	for (const [name, table] of Object.entries(MARKS))
+		for (const [key, [mark]] of Object.entries(table)) assert.doesNotMatch(mark, emoji, `${name}.${key}`);
+	assert.equal(DEFAULTS.ui.icons, 'text');
+	assert.deepEqual(kindMark('done', 'text'), ['done  ', 'ok']);
+	assert.equal(kindMark('review', 'text')[0].length, kindMark('start', 'text')[0].length, 'text tags share one width');
+	assert.deepEqual(kindMark('done', 'glyph'), ['✓', 'ok']);
+	assert.equal(statusMark('running', 'text')[0].trim(), 'run');
+	assert.equal(normalize(merge(DEFAULTS, { ui: { icons: 'glyph' } })).ui.icons, 'glyph');
+	assert.throws(() => normalize(merge(DEFAULTS, { ui: { icons: 'emoji' } } as never)), /ui\.icons/);
+	const activity = [{ at: 0, kind: 'fail' as const, text: 'broke' }];
+	const feed = (icons: 'text' | 'glyph') => {
+		const ui = render(createElement(Feed, { activity, v: { ...DEFAULTS.ui, icons, learning: false }, height: 3 }));
+		const f = frame(ui);
+		ui.unmount();
+		return f;
+	};
+	assert.match(feed('text'), /fail +broke/);
+	assert.match(feed('glyph'), /✗ broke/);
+	const tasks = [{ id: 'T-1', title: 'wire it', type: 'FIX', tier: 'S', status: 'running' as const, attempts: 1 }];
+	const ui = render(createElement(Tasks, { tasks, height: 3, t: 0 }));
+	assert.match(frame(ui), /run +T-1 wire it/);
+	ui.unmount();
+});
+
 test('scroll: PgUp in the cockpit pages the feed back, End returns to live', async (t) => {
 	const { config, manager, root } = machine();
 	const ui = render(createElement(Cockpit, { manager, config, depth: 'none', cwd: root, fast: true }));
@@ -581,6 +629,41 @@ test('improve: /improve runs a grounded improvement goal for the selected projec
 	assert.ok(run.o.snapshot().activity.some((a) => /^Brainstorm round 1/.test(a.text)), 'brainstormed even though the prompt writer called it concrete');
 });
 
+test('route command: /route sets, lists and clears session routes, refuses a bad key, and runs started afterwards use them', async (t) => {
+	const { config, manager, proj } = machine();
+	writeFileSync(join(proj, '.jarvis-code.json'), JSON.stringify({ agents: { claude: { kind: 'claude', enabled: true, bin: demoAgent, models: ['claude-fable-5-1'], env: { JC_DEMO_PACE: '2' } } } }));
+	const ui = render(createElement(Cockpit, { manager, config: normalize(merge(config, { routes: { planner: ['claude'] } })), depth: 'none', cwd: proj }));
+	t.after(() => {
+		ui.unmount();
+		return manager.stopAll();
+	});
+	await sleep(50);
+	const send = async (line: string) => {
+		await type(ui, line);
+		ui.stdin.write('\r');
+		await sleep(60);
+	};
+	await send('/route security codex');
+	assert.match(frame(ui), /SECURITY → codex from the next run/, 'a lowercase type is taken as the type');
+	await send('/route');
+	assert.match(frame(ui), /planner claude · SECURITY codex \(session\)/, 'configured and session routes, session ones marked');
+	await send('/route SECURITY -');
+	assert.match(frame(ui), /SECURITY route cleared/);
+	await send('/route');
+	assert.match(frame(ui), /planner claude/);
+	assert.doesNotMatch(frame(ui), /SECURITY codex/);
+	await send('/route bogus codex');
+	assert.match(frame(ui), /routes\.bogus: a role/, "normalize()'s message");
+	await send('/route');
+	assert.doesNotMatch(frame(ui), /bogus/, 'a refused route is not kept');
+	await send('/route FIX codex claude');
+	await send('/work');
+	for (let i = 0; i < 40 && !manager.list().length; i++) await sleep(25);
+	const run = manager.list()[0];
+	assert.ok(run, 'a run started');
+	assert.deepEqual(run.o.config.routes, { SECURITY: [], FIX: ['codex', 'claude'] }, 'the session routes, over the project config');
+});
+
 test('first run: the cockpit shows how to start and which agents it found, until there is work', async (t) => {
 	const { config, manager, root } = machine();
 	const fresh = join(root, 'fresh');
@@ -609,6 +692,7 @@ test('header: cost shows the planning part', () => {
 		source: 'store',
 		tasks: [],
 		workers: [],
+		nodes: [],
 		activity: [],
 		started: Date.now(),
 		reactor: 'idle' as const,
@@ -664,4 +748,326 @@ test('background: the cockpit shows a run from another process, /stop ends it, a
 	assert.ok(manager.list()[0].finished, "the cockpit's own run stopped");
 	process.kill(held.pid, 'SIGTERM');
 	for (let i = 0; i < 100 && Project.open(proj)!.running(); i++) await sleep(50);
+});
+
+test('graph view: goal, the stages that ran and their agent runs; a task lists its worker and reviewer runs', () => {
+	const draw = (snap: Snapshot, height = 40) => {
+		const ui = render(createElement(Graph, { snap, height }));
+		const f = frame(ui).split('\n');
+		ui.unmount();
+		return f;
+	};
+	const rows = draw(sampleSnapshot());
+	assert.match(rows[0], /G R A P H\s+10 agent runs · Esc to close/);
+	assert.equal(rows[1], 'Modernize the settings system');
+	const stages = rows.filter((r) => /^[├└]─ .* runs? · \$/.test(r)).map((r) => r.slice(3).split('  ')[0]);
+	assert.deepEqual(stages, ['prompt writer', 'brainstorm', 'critique', 'planner', 'tasks', 'coverage']);
+	assert.ok(rows.some((r) => /^│  └─ done +planning prompt  claude:claude-fable-5-1  1m00s · \$0\.12$/.test(r)), 'a node row: state tag, label, route, elapsed, cost');
+	assert.ok(rows.some((r) => /^│  └─ fail +users · round 1  claude:claude-fable-5-1/.test(r)), 'a failed run is tagged fail');
+	assert.ok(rows.some((r) => /^   └─ run +coverage  claude:claude-fable-5-1  1m3\ds · \$0\.12$/.test(r)), 'a running node counts its time to now');
+	const at = rows.findIndex((r) => /T-0001 Add the settings schema/.test(r));
+	assert.match(rows[at], /^│  ├─ done +T-0001 Add the settings schema  claude:claude-fable-5-1$/);
+	assert.match(rows[at + 1], /^│  │  ├─ done +worker  claude:claude-fable-5-1/);
+	assert.match(rows[at + 2], /^│  │  └─ done +reviewer  codex:gpt-5/);
+	assert.ok(rows.some((r) => /T-0002 Load settings from disk/.test(r)) && rows.some((r) => /^│  │  └─ run +worker  codex:gpt-5  1m3\ds/.test(r)));
+	assert.ok(!rows.some((r) => /T-0004|T-0005/.test(r)), 'tasks no agent ran for are the tree view, not the graph');
+	assert.ok(rows.every((r) => r.length <= 100), 'rows are truncated to the pane width');
+	assert.match(draw(sampleSnapshot(), 6).at(-1)!, /… \d+ more/);
+
+	const bare: Snapshot = { phase: 'idle', paused: false, source: 'store', tasks: [], workers: [], nodes: [], activity: [], cost: 0, started: Date.now(), reactor: 'idle', stateSince: 0, prevReactor: 'idle', routes: [] };
+	assert.match(draw(bare).join('\n'), /0 agent runs[\s\S]*this run: no agent has run yet/);
+	// A worker whose task is not in the snapshot, and nodes with no model, end or task.
+	const sparse = { ...bare, nodes: [{ id: 'x', role: 'worker' as const, label: 'Gone', task: 'T-0099', route: 'r', state: 'failed' as const, started: 0, cost: 0, last: '', lastAt: 0 }, { id: 'y', role: 'planner' as const, label: 'plan', route: 'r', state: 'running' as const, started: Date.now(), cost: 0, last: '', lastAt: 0 }] };
+	const f = draw(sparse).join('\n');
+	assert.match(f, /working the queue\n├─ planner[\s\S]*└─ tasks[\s\S]*   └─ T-0099\n      └─ fail +worker  r/);
+});
+
+test('graph clauses: done items sit under the goal row with a met, unmet or open tag and the tasks covering them; unmet is warn', () => {
+	const draw = (snap: Snapshot) => {
+		const ui = render(createElement(Graph, { snap, height: 40, icons: 'glyph' }));
+		const f = frame(ui).split('\n');
+		ui.unmount();
+		return f;
+	};
+	const rows = draw(sampleSnapshot());
+	assert.equal(rows[1], 'Modernize the settings system');
+	assert.deepEqual(rows.slice(2, 5), [
+		'├─ met   settings load from disk  T-0001, T-0002',
+		'├─ unmet old settings files still load  T-0003',
+		'├─ open  the settings are documented',
+	], 'text tags even with glyph icons, before the stages');
+	assert.match(rows[5], /^├─ prompt writer/);
+	assert.deepEqual([clauseMark('met')[1], clauseMark('unmet')[1], clauseMark('open')[1]], ['ok', 'warn', 'textFaint']);
+	assert.ok(!draw({ ...sampleSnapshot(), clauses: undefined }).some((r) => /settings load from disk/.test(r)), 'no clauses, no checklist');
+});
+
+test('tree view: tasks by their depends, a second dependency as a reference row, cycles marked', () => {
+	const draw = (tasks: Snapshot['tasks'], height = 30) => {
+		const ui = render(createElement(DepTree, { tasks, height }));
+		const f = frame(ui).split('\n');
+		ui.unmount();
+		return f;
+	};
+	const rows = draw(sampleSnapshot().tasks);
+	assert.deepEqual(rows, [
+		rows[0],
+		'done   T-0001 Add the settings schema  claude:claude-fable-5-1',
+		'├─ run    T-0002 Load settings from disk  codex:gpt-5',
+		'│  └─ queued T-0004 Migrate old settings files',
+		'│     └─ queued T-0005 Document the settings',
+		'└─ fail   T-0003 Validate settings on save',
+		'   └─ → queued T-0004 Migrate old settings files',
+	]);
+	assert.match(rows[0], /T R E E\s+5 tasks · Esc to close/);
+	assert.equal(rows.filter((r) => r.includes('T-0004')).length, 2, 'the task with two dependencies once, plus one reference row');
+
+	const task = (id: string, ...depends: string[]) => ({ id, title: `task ${id}`, type: 'FIX', tier: 'S', status: 'queued' as const, attempts: 0, depends });
+	const cyclic = draw([task('T-1', 'T-2'), task('T-2', 'T-1'), task('T-3', 'T-404'), { ...task('T-4'), depends: undefined }]);
+	assert.deepEqual(cyclic.slice(1), [
+		'queued T-3 task T-3',
+		'queued T-4 task T-4',
+		'queued T-1 task T-1  (cycle)',
+		'└─ queued T-2 task T-2  (cycle)',
+		'   └─ → queued T-1 task T-1  (cycle)',
+	]);
+	assert.match(draw([]).join('\n'), /no tasks yet/);
+});
+
+test('graph command: /graph and /tree toggle a pane over the run body, Esc closes it before going home', async (t) => {
+	const { config, manager, root } = machine();
+	const ui = render(createElement(Cockpit, { manager, config, depth: 'none', cwd: root, fast: true }));
+	t.after(() => {
+		ui.unmount();
+		return manager.stopAll();
+	});
+	const send = async (line: string) => {
+		await type(ui, line);
+		ui.stdin.write('\r');
+		await sleep(60);
+		return frame(ui);
+	};
+	await sleep(50);
+	assert.match(await send('/graph'), /\/graph: open a run first/);
+	assert.match(await send('/tree'), /\/tree: open a run first/);
+	assert.doesNotMatch(frame(ui), /G R A P H|T R E E/);
+
+	await send('/demo');
+	for (let i = 0; i < 200 && !manager.list()[0]?.finished; i++) await sleep(50);
+	assert.ok(manager.list()[0]?.finished, 'the demo run finished');
+	await sleep(100);
+	let f = await send('/graph');
+	assert.match(f, /G R A P H/);
+	assert.match(f, /G R A P H.*\n.*Modernize the settings system.*\n.*├─ met   the settings load from src\/config\.ts  M-0001/, 'the checklist first, under the goal');
+	assert.doesNotMatch(f, /Q U E U E/, 'the pane takes the whole body');
+	f = await send('/graph');
+	assert.doesNotMatch(f, /G R A P H/, 'a second /graph closes it');
+	assert.match(f, /Q U E U E/);
+	f = await send('/tree');
+	assert.match(f, /T R E E/);
+	assert.doesNotMatch(f, /Q U E U E/);
+	f = await send('/graph');
+	assert.match(f, /G R A P H/, '/graph swaps the tree for the graph');
+	assert.doesNotMatch(f, /T R E E/);
+	ui.stdin.write('\x1b');
+	await sleep(60);
+	f = frame(ui);
+	assert.doesNotMatch(f, /G R A P H/);
+	assert.match(f, /Q U E U E/, 'Esc closed the pane and stayed in the run');
+	ui.stdin.write('\x1b');
+	await sleep(60);
+	assert.match(frame(ui), /P R O J E C T S/, 'the next Esc goes home');
+});
+
+test('diff pager: markers coloured, binary folded, a window of height lines from top, capped with a count', () => {
+	const patch = [
+		'diff --git a/x.ts b/x.ts',
+		'index 1111111..2222222 100644',
+		'--- a/x.ts',
+		'+++ b/x.ts',
+		'@@ -1,3 +1,3 @@',
+		' keep\tme',
+		'-old',
+		'+new',
+		'--- was a comment',
+		'diff --git a/img.png b/img.png',
+		'new file mode 100644',
+		'GIT binary patch',
+		'literal 3',
+		'KcmZ?wbN>Ja',
+		'',
+		'literal 0',
+		'HcmV?d00001',
+		'',
+		'diff --git a/y.bin b/y.bin',
+		'Binary files a/y.bin and b/y.bin differ',
+		'',
+	].join('\n');
+	const lines = pageLines(patch);
+	const color = (text: string) => lines.find((l) => l.text === text)?.color;
+	for (const head of ['diff --git a/x.ts b/x.ts', 'index 1111111..2222222 100644', '--- a/x.ts', '+++ b/x.ts', '@@ -1,3 +1,3 @@', 'new file mode 100644']) assert.equal(color(head), c.accent, head);
+	assert.equal(color('+new'), c.ok);
+	assert.equal(color('-old'), c.danger);
+	assert.equal(color('--- was a comment'), c.danger, 'a removed line inside a hunk is not a file header');
+	assert.equal(color(' keep  me'), c.text, 'tabs become spaces');
+	assert.deepEqual(lines.filter((l) => l.text === '[binary]').length, 2, 'a GIT binary patch and a "Binary files differ" line each show as [binary]');
+	assert.ok(!lines.some((l) => /literal|KcmZ|HcmV/.test(l.text)), 'binary contents are not shown');
+	assert.equal(lines.at(-1)?.text, '[binary]', 'no trailing blank line');
+
+	const ui = render(createElement(Pager, { text: patch, height: 3, top: 5 }));
+	const f = frame(ui);
+	ui.unmount();
+	assert.deepEqual(f.split('\n').map((l) => l.trimEnd()), [' keep  me', '-old', '+new']);
+
+	const long = Array.from({ length: PAGER_MAX + 3 }, (_, i) => `+row ${i + 1}`).join('\n');
+	const capped = pageLines(long);
+	assert.equal(capped.length, PAGER_MAX + 1);
+	assert.equal(capped.at(-1)?.text, '… 3 more lines');
+	const end = render(createElement(Pager, { text: long, height: 2, top: 99_999 }));
+	const g = frame(end);
+	end.unmount();
+	assert.deepEqual(g.split('\n').map((l) => l.trimEnd()), [`+row ${PAGER_MAX}`, '… 3 more lines'], 'top past the end shows the last page');
+});
+
+test('diff command: /diff pages a task\'s last patch, read once; no patch says so; the feed keeps diffs off', async (t) => {
+	assert.equal(DEFAULTS.ui.showDiffs, false, 'the feed stays completions-first');
+	const { config, manager, proj } = machine();
+	const ui = render(createElement(Cockpit, { manager, config, depth: 'none', cwd: proj, fast: true }));
+	t.after(() => {
+		ui.unmount();
+		return manager.stopAll();
+	});
+	const send = async (line: string) => {
+		await type(ui, line);
+		ui.stdin.write('\r');
+		await sleep(60);
+		return frame(ui);
+	};
+	await sleep(80);
+	assert.match(await send('/diff'), /\/diff \[task\]: pick a task/);
+	assert.match(await send('/diff T-0001'), /no patch for T-0001/);
+	assert.doesNotMatch(frame(ui), /D I F F/);
+
+	const rows = Array.from({ length: 30 }, (_, i) => `+row ${String(i + 1).padStart(2, '0')}`);
+	const store = new Project(proj);
+	const file = store.research('patch-T-0001-1-x', ['diff --git a/f b/f', '@@ -0,0 +1,30 @@', ...rows].join('\n'));
+	store.update('T-0001', (task) => {
+		task.attempts.push({ at: new Date().toISOString(), route: 'claude:x', ok: false, patch: file });
+		task.attempts.push({ at: new Date().toISOString(), route: 'claude:x', ok: false });
+	});
+	// The default is the open task; the newest attempt that kept a patch is the one shown.
+	await send('/task show T-0001');
+	let f = await send('/diff');
+	assert.match(f, /D I F F/);
+	assert.match(f, /diff --git a\/f b\/f/);
+	assert.doesNotMatch(f, /Wire the parser/, 'the pager takes the whole body');
+	writeFileSync(file, 'diff --git a/g b/g\n+rewritten\n');
+	ui.stdin.write('\x1b[6~');
+	await sleep(60);
+	f = frame(ui);
+	assert.doesNotMatch(f, /diff --git a\/f/, 'PgDn scrolls the pager');
+	assert.match(f, /\+row \d\d/);
+	assert.doesNotMatch(f, /rewritten|a\/g/, 'the patch is read once, when the command runs');
+	ui.stdin.write('\x1b[5~');
+	await sleep(60);
+	assert.match(frame(ui), /diff --git a\/f b\/f/, 'PgUp scrolls back');
+	ui.stdin.write('\x1b');
+	await sleep(60);
+	f = frame(ui);
+	assert.doesNotMatch(f, /D I F F/, 'Esc closes the pager');
+	assert.match(f, /Wire the parser/, 'and goes back to what was open');
+
+	// A live run: the patch comes from the run itself.
+	await send('/demo');
+	const run = manager.list()[0];
+	run.o.patch = (id) => (id === 'T-0002' ? 'diff --git a/live b/live\n+from the run\n' : undefined);
+	f = await send('/diff t-0002');
+	assert.match(f, /D I F F/);
+	assert.match(f, /\+from the run/);
+});
+
+/** A project whose runs use the slow demo agent, so a run stays live while the test types. */
+function slowProject(proj: string) {
+	writeFileSync(
+		join(proj, '.jarvis-code.json'),
+		JSON.stringify({ agents: { claude: { kind: 'claude', enabled: true, bin: demoAgent, models: ['claude-fable-5-1'], env: { JC_DEMO_PACE: '800' } } }, planner: ['claude:claude-fable-5-1'], workers: ['claude:claude-fable-5-1'], planning: { mode: 'direct' } }),
+	);
+}
+
+test('cockpit queue: goals typed during a run are queued, /queue lists them, /unqueue takes one off, the status line shows them', async (t) => {
+	const { config, manager, proj } = machine();
+	slowProject(proj);
+	const ui = render(createElement(Cockpit, { manager, config, depth: 'none', cwd: proj }));
+	t.after(() => {
+		ui.unmount();
+		return manager.stopAll();
+	});
+	await sleep(50);
+	const send = async (line: string) => {
+		await type(ui, line);
+		ui.stdin.write('\r');
+		await sleep(80);
+	};
+	await send('first goal');
+	for (let i = 0; i < 40 && !manager.list().length; i++) await sleep(25);
+	const run = manager.list()[0];
+	assert.ok(run && !run.finished, 'the first goal started a run');
+	await send('second goal');
+	assert.match(frame(ui), new RegExp(`queued #1 in alpha: starts when run #${run.id} ends`));
+	await send('/run third goal');
+	assert.match(frame(ui), /queued #2 in alpha/);
+	await send('/brainstorm fourth goal');
+	assert.match(frame(ui), /queued #3 in alpha.*\(as a/, 'a brainstorm queues its plain goal and says so');
+	assert.equal(manager.list().length, 1, 'no second run started');
+	ui.stdin.write('\r');
+	await sleep(80);
+	assert.match(frame(ui), /run #\d+ · next: 1 second goal · 2 third goal/, "the run view's status line shows the queue");
+	await send('/queue');
+	assert.match(frame(ui), /1 second goal · 2 third goal · 3 fourth goal/);
+	await send('/unqueue 1');
+	assert.match(frame(ui), /unqueued: second goal/);
+	assert.deepEqual(manager.queued(proj).map((g) => g.goal), ['third goal', 'fourth goal']);
+	await send('/unqueue 9');
+	assert.match(frame(ui), /no queued goal 9/);
+	ui.stdin.write('\r');
+	await sleep(80);
+	assert.match(frame(ui), /next: 1 third goal · 2 fourth goal/, 'the status line follows /unqueue');
+	manager.stop(run);
+	await run.done;
+});
+
+test('tell command: /tell needs an id and a note, keeps the note as the hint with no run, and sends it to a live run', async (t) => {
+	const { config, manager, proj } = machine();
+	const ui = render(createElement(Cockpit, { manager, config, depth: 'none', cwd: proj }));
+	t.after(() => {
+		ui.unmount();
+		return manager.stopAll();
+	});
+	await sleep(50);
+	const send = async (line: string) => {
+		await type(ui, line);
+		ui.stdin.write('\r');
+		await sleep(80);
+	};
+	await send('/tell');
+	assert.match(frame(ui), /\/tell <task id> <note>/);
+	await send('/tell T-0001');
+	assert.match(frame(ui), /\/tell <task id> <note>/, 'a note is needed too');
+	await send('/tell t-0001 mind the tabs');
+	assert.match(frame(ui), /T-0001: note kept as its hint/);
+	await send('/tell T-0001 and the quotes');
+	assert.equal(Project.open(proj)!.get('T-0001')!.hint, 'mind the tabs\nand the quotes', 'notes add up');
+	await send('/tell T-0099 hello');
+	assert.match(frame(ui), /no task T-0099/);
+
+	slowProject(proj);
+	await send('/work');
+	for (let i = 0; i < 100 && manager.list()[0]?.o.snapshot().phase !== 'working'; i++) await sleep(50);
+	const run = manager.list()[0];
+	assert.ok(run && !run.finished, 'a run is going');
+	await send('/tell T-0001 use the fast path');
+	assert.match(frame(ui), /T-0001: note kept for its next attempt/);
+	assert.ok(run.o.snapshot().activity.some((a) => /T-0001: note kept for its next attempt/.test(a.text)), "the live run's tell took it");
+	assert.match(Project.open(proj)!.get('T-0001')!.hint ?? '', /use the fast path/);
+	manager.stop(run);
+	await run.done;
 });

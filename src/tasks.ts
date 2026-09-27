@@ -16,7 +16,7 @@ export interface Task {
 	steps: string[];
 	/** What a worker needs beyond the title (approach, files, pitfalls). */
 	brief?: string;
-	/** What a person said when they sent this task back: guidance for the next worker. */
+	/** What a person said about this task (sending it back, or a note mid-run): guidance for the next worker. */
 	hint?: string;
 	/** Task ids this one waits for. */
 	depends?: string[];
@@ -78,6 +78,10 @@ export interface TaskSource {
 	beat?(a: { at: number; kind: string; text: string; task?: string }): void;
 	/** Replace a blocked task with smaller ones: add them, drop it, and move its dependents onto them. */
 	split?(task: Task, plan: PlannedTask[], why: string): Promise<string[]>;
+	/** Add a person's note to the task's hint; false when the task is unknown, done or dropped. */
+	tell?(id: string, text: string): boolean;
+	/** The task's hint as it is now, notes included. */
+	hint?(id: string): string | undefined;
 }
 
 const tail = (s: string, n = 400) => (s.length > n ? '…' + s.slice(-n) : s).trim();
@@ -210,6 +214,18 @@ export class StoreSource implements TaskSource {
 	beat(a: { at: number; kind: string; text: string; task?: string }): void {
 		this.project.beat(a);
 	}
+
+	tell(id: string, text: string): boolean {
+		const t = this.project.get(id);
+		if (!t || t.status === 'done' || t.status === 'dropped') return false;
+		this.project.update(id, (t) => (t.hint = t.hint ? `${t.hint}\n${text}` : text));
+		this.project.log({ event: 'note', id });
+		return true;
+	}
+
+	hint(id: string): string | undefined {
+		return this.project.get(id)?.hint;
+	}
 }
 
 // --- in memory ------------------------------------------------------------------------
@@ -273,6 +289,17 @@ export class MemorySource implements TaskSource {
 
 	async block(task: Task, reason: string): Promise<void> {
 		Object.assign(this.find(task), { status: 'blocked', reason });
+	}
+
+	tell(id: string, text: string): boolean {
+		const t = this.tasks.find((x) => x.id === id);
+		if (!t || t.status === 'done' || t.status === 'split') return false;
+		t.hint = t.hint ? `${t.hint}\n${text}` : text;
+		return true;
+	}
+
+	hint(id: string): string | undefined {
+		return this.tasks.find((x) => x.id === id)?.hint;
 	}
 
 	private find(task: Task) {

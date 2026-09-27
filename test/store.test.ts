@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { decideTask, listStored, nextStep, Project } from '../src/store.js';
+import { readIntent } from '../src/intent.js';
 import { MemorySource, StoreSource } from '../src/tasks.js';
 import { workerPrompt } from '../src/orchestrator.js';
 import { contextPack } from '../src/context.js';
@@ -120,6 +121,26 @@ test('store: a decision on a status word acts on every task in it', () => {
 	assert.throws(() => decideTask(p, 'approve', 'review'));
 });
 
+test('intent decisions: drop and approve record the title and project, one per task in bulk; off records nothing', () => {
+	process.env.JARVIS_CODE_STATE = join(tmp('state'), 'jc');
+	const dir = tmp('proj');
+	const p = new Project(dir, tmp('store'));
+	p.add([{ title: 'rewrite the router' }, { title: 'add dark mode' }, { title: 'fix login' }, { title: 'port to rust' }]);
+	decideTask(p, 'drop', 'T-0004', 'not now', { intent: false });
+	decideTask(p, 'retry', 'T-0004', undefined, { intent: true });
+	assert.deepEqual(readIntent(), []);
+
+	decideTask(p, 'drop', 'T-0001', 'not wanted', { intent: true });
+	p.setStatus('T-0002', 'review', 'no verify command');
+	p.setStatus('T-0003', 'review', 'no verify command');
+	decideTask(p, 'approve', 'review', undefined, { intent: true });
+	const name = p.meta.name;
+	assert.deepEqual(
+		readIntent().map((e) => [e.kind, e.text, e.project]),
+		[['dropped', 'rewrite the router', name], ['accepted', 'add dark mode', name], ['accepted', 'fix login', name]],
+	);
+});
+
 test('store: a retry with a why carries it to the next worker as a hint', () => {
 	const p = new Project(tmp('proj'), tmp('store'));
 	const dir = tmp('cwd');
@@ -134,7 +155,7 @@ test('store: a retry with a why carries it to the next worker as a hint', () => 
 	return next.then((tasks) => {
 		const task = tasks.find((t) => t.id === 'T-0001')!;
 		assert.equal(task.hint, 'the fixture is in test/data');
-		assert.match(workerPrompt(task, dir, {}), /The person who sent this task back said: the fixture is in test\/data/);
+		assert.match(workerPrompt(task, dir, {}), /A person's notes on this task \(sent with it or while it ran\):\nthe fixture is in test\/data/);
 
 		p.setStatus('T-0001', 'blocked', 'y');
 		decideTask(p, 'retry', 'T-0001');
@@ -234,4 +255,29 @@ test('store: failure causes of failed attempts reach the planner, most common fi
 	p.update('T-0001', (t) => (t.attempts = [fail('agent'), fail('too-big'), { at: 'x', route: 'r', ok: true }]));
 	p.update('T-0002', (t) => (t.attempts = [fail('too-big'), fail()]));
 	assert.equal(p.firstTry(), 'S: 0 of 2 passed on the first attempt; failed attempts by cause: too-big 2, agent 1');
+});
+
+test('goal queue: positions, no duplicates, oldest first, survives a new handle, a bad file is empty', () => {
+	const dir = tmp('proj');
+	const root = tmp('store');
+	const p = new Project(dir, root);
+	assert.deepEqual(p.goals(), []);
+	assert.equal(p.nextGoal(), undefined);
+	assert.equal(p.enqueue('add a'), 1);
+	assert.equal(p.enqueue('add b'), 2);
+	assert.equal(p.enqueue('add a'), 1);
+	assert.equal(p.enqueue('add c'), 3);
+	assert.deepEqual(p.goals().map((g) => g.goal), ['add a', 'add b', 'add c']);
+	assert.equal(typeof p.goals()[0].at, 'string');
+	// Another handle on the same project sees the same queue.
+	const again = Project.open(dir, root)!;
+	assert.equal(again.unqueue(2)?.goal, 'add b');
+	assert.equal(again.unqueue(5), undefined);
+	assert.equal(p.nextGoal(), 'add a');
+	assert.deepEqual(p.goals().map((g) => g.goal), ['add c']);
+	const events = readFileSync(join(p.dir, 'ledger.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l).event);
+	assert.deepEqual(events.filter((e) => e === 'queue' || e === 'unqueue'), ['queue', 'queue', 'queue', 'unqueue', 'unqueue']);
+	writeFileSync(join(p.dir, 'goals.json'), '{ not json');
+	assert.deepEqual(p.goals(), []);
+	assert.equal(p.enqueue('add d'), 1);
 });

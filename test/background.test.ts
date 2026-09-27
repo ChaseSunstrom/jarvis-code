@@ -74,6 +74,26 @@ test('background: work --detach runs the queue with its log kept in the store; s
 	assert.notEqual(p().get('T-0001')?.status, 'done', 'stopped before it finished; the task stays open');
 });
 
+test('cli queue: a goal for a busy project is queued, and a CLI run that ends normally works it', async () => {
+	const { proj, env } = setup(2);
+	const p = new Project(proj);
+	const other = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)']);
+	p.lock({ pid: other.pid, by: 'cli' });
+	const run = (...args: string[]) => execFileSync(process.execPath, [cli, ...args], { cwd: proj, env: { ...env, JC_DEMO_PLAN: JSON.stringify({ tasks: [{ title: 'Make q', tier: 'S', acs: [{ text: 'q exists', verify: 'test -f out/q.done' }] }] }) }, encoding: 'utf8' });
+	assert.match(run('Make q', '--plain'), new RegExp(`queued #1 in proj: runs after the current run \\(pid ${other.pid}\\)`));
+	assert.deepEqual(p.goals().map((g) => g.goal), ['Make q']);
+	other.kill();
+	await new Promise((r) => other.on('exit', r));
+
+	run('task', 'add', 'Make a', '--ac', 'a exists :: test -f out/a.done');
+	run('work', '--plain'); // throws on a non-zero exit
+	assert.deepEqual(p.goals(), [], 'the queue is drained');
+	const q = p.tasks().find((t) => t.goal === 'Make q');
+	assert.equal(q?.status, 'done', 'the queued goal was planned and worked');
+	assert.equal(p.get('T-0001')?.status, 'done');
+	assert.equal(p.running(), undefined);
+});
+
 test('background: a reused pid is not the run, a detach that fails says why, and old logs are pruned', async () => {
 	const { proj } = setup(2);
 	const p = new Project(proj);
@@ -89,4 +109,26 @@ test('background: a reused pid is not the run, a detach that fails says why, and
 	await assert.rejects(runDetached(proj, ['work', '--no-such-flag']), /the background run did not start: .*no-such-flag/);
 	for (let i = 0; i < 25; i++) p.runLog();
 	assert.ok(readdirSync(join(p.dir, 'runs')).length <= 20);
+});
+
+test('improve cli: --rounds and --min override config.improve, each round builds on the last, and the loop says why it ended', () => {
+	const { proj, env } = setup(2);
+	const plan = JSON.stringify({ tasks: [{ title: 'Make i', tier: 'S', acs: [{ text: 'i exists', verify: 'test -f out/i.done' }] }] });
+	const improve = (...args: string[]) => execFileSync(process.execPath, [cli, 'improve', ...args, '--plain'], { cwd: proj, env: { ...env, JC_DEMO_PLAN: plan }, encoding: 'utf8', stdio: 'pipe' });
+	const two = improve('--rounds', '2', '--min', '0');
+	assert.match(two, /improve round 1\/2: 1 landed/);
+	assert.match(two, /improve round 2\/2: 1 landed/);
+	assert.match(two, /improve ended after round 2 \(rounds\): all 2 rounds ran/);
+	const goals = new Project(proj).tasks().map((t) => t.goal ?? '');
+	assert.equal(goals.length, 2);
+	assert.doesNotMatch(goals[0], /previous round/);
+	assert.match(goals[1], /previous round built: "Make i"/, 'round 2 builds on what round 1 closed');
+
+	const dry = improve('--rounds', '3', '--min', '5');
+	assert.match(dry, /improve round 1\/3: 1 landed/);
+	assert.match(dry, /improve ended after round 1 \(dry\): it landed fewer than 5 tasks/);
+	assert.doesNotMatch(dry, /round 2\/3/);
+
+	for (const [flag, v, msg] of [['--rounds', 'x', /--rounds must be a positive integer/], ['--min', '1.5', /--min must be a whole number, 0 or more/]] as const)
+		assert.throws(() => improve(flag, v), (e: { status: number; stderr: string }) => e.status === 2 && msg.test(e.stderr));
 });

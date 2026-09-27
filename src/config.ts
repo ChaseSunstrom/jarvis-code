@@ -36,6 +36,11 @@ export interface Config {
 	/** Route ids (`agent` or `agent:model`) in preference order; empty = every enabled route. */
 	planner: string[];
 	workers: string[];
+	/**
+	 * Route ids per role (ROUTE_ROLES), per task type (ROUTE_TYPES, for workers) or `default`, so one kind of work
+	 * can go to the agent best at it. It only chooses among defined agents, so an untrusted project config may set it.
+	 */
+	routes: Record<string, string[]>;
 	/** `priority`: first healthy route in order · `best`: highest learned score (per task type) · `escalate`: workers listed cheapest → strongest, big and security tasks start strongest. */
 	strategy: 'priority' | 'best' | 'escalate';
 	maxAttempts: number;
@@ -53,6 +58,8 @@ export interface Config {
 		reactor: 'large' | 'small' | 'off';
 		/** `blocks`: anti-aliased half blocks (truecolor); `braille`: finer dots, font-dependent. */
 		reactorStyle: 'blocks' | 'braille';
+		/** Feed and queue marks: `text` tags (done, fail, run) or `glyph` symbols. */
+		icons: 'text' | 'glyph';
 		reducedMotion: boolean;
 		alternateScreen: boolean;
 		activityLines: number;
@@ -93,8 +100,20 @@ export interface Config {
 		minNew: number;
 		/** Brainstormers at once. */
 		parallel: number;
+		/** A critic on another route scores and ranks the ideas, so the planner starts from the best rather than all of them. */
+		critique: boolean;
+		/** At the end of a run, an agent checks the goal's done-items against what landed and queues follow-up work for the gaps. */
+		coverage: boolean;
 	};
+	/** Remember (redacted, across projects) what the user asks for and turns down, so later plans lean toward what they want. */
+	intent: boolean;
+	/** `improve` runs rounds of plan-and-work, each seeing what the last landed; a round landing fewer than `minLanded` tasks ends it. */
+	improve: { rounds: number; minLanded: number };
 }
+
+/** Keys of `routes` besides `default`. ROUTE_TYPES is store.ts's TYPES, written out because store.ts imports this file. */
+export const ROUTE_ROLES = ['promptWriter', 'brainstorm', 'critic', 'planner', 'reviewer', 'workers'];
+export const ROUTE_TYPES = ['RESEARCH', 'CLEAN', 'PERF', 'SECURITY', 'FIX', 'FEATURE'];
 
 const KIND_DEFAULTS: Record<AgentKind, Omit<AgentConfig, 'kind'>> = {
 	claude: { enabled: 'auto', bin: 'claude', models: [], args: [], env: {}, disablePlugins: ['foreman@foreman'], timeoutMin: 60, idleMin: 30 },
@@ -111,6 +130,7 @@ export const DEFAULTS: Config = {
 	},
 	planner: [],
 	workers: [],
+	routes: {},
 	strategy: 'priority',
 	maxAttempts: 3,
 	maxParallel: 1,
@@ -122,6 +142,7 @@ export const DEFAULTS: Config = {
 		fps: 24,
 		reactor: 'large',
 		reactorStyle: 'blocks',
+		icons: 'text',
 		reducedMotion: false,
 		alternateScreen: true,
 		activityLines: 12,
@@ -133,7 +154,17 @@ export const DEFAULTS: Config = {
 	worktrees: true,
 	notify: '',
 	budget: { usd: 0, minutes: 0 },
-	planning: { mode: 'auto', lenses: ['user value', 'reliability', 'simplicity', 'bold bets'], rounds: 3, minNew: 3, parallel: 4 },
+	planning: {
+		mode: 'auto',
+		lenses: ['user value', 'reliability', 'simplicity', 'bold bets', 'unstated needs (what the user will want next without saying it)'],
+		rounds: 3,
+		minNew: 3,
+		parallel: 4,
+		critique: true,
+		coverage: true,
+	},
+	intent: true,
+	improve: { rounds: 3, minLanded: 1 },
 };
 
 export const paths = {
@@ -180,16 +211,29 @@ export function normalize(raw: Config): Config {
 		if (!Array.isArray(agents[name].models)) throw new Error(`agents.${name}.models: must be an array`);
 	}
 	for (const key of ['planner', 'workers'] as const) if (!Array.isArray(raw[key])) throw new Error(`${key}: must be an array of route ids`);
+	if (!isObj(raw.routes)) throw new Error('routes: an object of role, task type or default → route ids');
+	const routes: Record<string, string[]> = {};
+	for (const [k, ids] of Object.entries(raw.routes)) {
+		const key = ROUTE_TYPES.includes(k.toUpperCase()) ? k.toUpperCase() : k;
+		if (key !== 'default' && !ROUTE_ROLES.includes(key) && !ROUTE_TYPES.includes(key)) throw new Error(`routes.${k}: a role (${ROUTE_ROLES.join(', ')}), a task type (${ROUTE_TYPES.join(', ')}) or default`);
+		if (!Array.isArray(ids) || !ids.every((id) => typeof id === 'string' && id)) throw new Error(`routes.${k}: must be an array of route ids`);
+		routes[key] = ids;
+	}
 	for (const k of ['usd', 'minutes'] as const)
 		if (typeof raw.budget[k] !== 'number' || !(raw.budget[k] >= 0)) throw new Error(`budget.${k}: a number, 0 (no cap) or more`);
 	if (!['priority', 'best', 'escalate'].includes(raw.strategy)) throw new Error('strategy: priority, best or escalate');
 	if (!['off', 'risky', 'all'].includes(raw.review)) throw new Error('review: off, risky or all');
+	if (!['text', 'glyph'].includes(raw.ui.icons)) throw new Error('ui.icons: text or glyph');
 	const pl = raw.planning;
 	if (!['auto', 'direct', 'deep'].includes(pl.mode)) throw new Error('planning.mode: auto, direct or deep');
 	for (const k of ['rounds', 'parallel'] as const) if (!Number.isInteger(pl[k]) || pl[k] < 1) throw new Error(`planning.${k}: a whole number, 1 or more`);
 	if (!Number.isInteger(pl.minNew) || pl.minNew < 0) throw new Error('planning.minNew: a whole number, 0 or more');
 	if (!Array.isArray(pl.lenses) || !pl.lenses.every((l) => typeof l === 'string')) throw new Error('planning.lenses: an array of angle names');
-	return { ...raw, agents };
+	for (const k of ['critique', 'coverage'] as const) if (typeof pl[k] !== 'boolean') throw new Error(`planning.${k}: true or false`);
+	if (typeof raw.intent !== 'boolean') throw new Error('intent: true or false');
+	if (!Number.isInteger(raw.improve.rounds) || raw.improve.rounds < 1) throw new Error('improve.rounds: a whole number, 1 or more');
+	if (!Number.isInteger(raw.improve.minLanded) || raw.improve.minLanded < 0) throw new Error('improve.minLanded: a whole number, 0 or more');
+	return { ...raw, agents, routes };
 }
 
 export interface Loaded {

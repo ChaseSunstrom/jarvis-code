@@ -9,7 +9,7 @@ import { loadConfig, merge, normalize, type Config } from './config.js';
 import { Learning } from './learn.js';
 import { Orchestrator, type Snapshot } from './orchestrator.js';
 import { claudeInstalled, PLUGIN_DIR } from './plugin.js';
-import { Project } from './store.js';
+import { Project, type QueuedGoal } from './store.js';
 import { MemorySource, StoreSource, type TaskSource } from './tasks.js';
 
 export interface Run {
@@ -133,8 +133,45 @@ export class RunManager extends EventEmitter {
 		project?.lock({ goal: opts.goal, by: 'cockpit' });
 		const run = this.launch(abs, config, src, opts.goal);
 		run.warnings = warnings;
-		if (project) void run.done.finally(() => project.unlock());
+		if (project) void run.done.finally(() => project.unlock()).then(() => this.drain(abs, run, project, opts));
 		return run;
+	}
+
+	/**
+	 * Start a run on the goal, or queue the goal when the project already has a run going, here
+	 * or in another process; one run per project works through many goals. Memory and goal-less
+	 * runs have no queue entry to make, so they keep start()'s error.
+	 */
+	async submit(dir: string, opts: StartOptions = {}): Promise<{ run?: Run; queued?: number }> {
+		const abs = resolve(dir);
+		// A demo has no store to queue in (nor a drain): it keeps start()'s error.
+		if (opts.goal && !opts.memory && (this.active().some((r) => r.dir === abs && !r.demo) || Project.open(abs)?.running())) return { queued: new Project(abs).enqueue(opts.goal) };
+		return { run: await this.start(abs, opts) };
+	}
+
+	/** Goals waiting for the project's run to end, oldest first. */
+	queued(dir: string): QueuedGoal[] {
+		return Project.open(dir)?.goals() ?? [];
+	}
+
+	/** Take queued goal n (1-based) off the project's queue; undefined when there is none. */
+	unqueue(dir: string, n: number): QueuedGoal | undefined {
+		return Project.open(dir)?.unqueue(n);
+	}
+
+	/** After a run finished on its own (not stopped), start the project's next queued goal. */
+	private async drain(dir: string, run: Run, project: Project, opts: StartOptions): Promise<void> {
+		if (run.o.snapshot().phase !== 'finished' || project.running()) return;
+		const goal = project.nextGoal();
+		if (!goal) return;
+		try {
+			await this.start(dir, { ...opts, goal });
+		} catch (e) {
+			// Put it back rather than lose it; the next run that finishes tries again.
+			project.enqueue(goal);
+			project.log({ event: 'queue-failed', goal, error: (e as Error).message });
+		}
+		this.emit('update');
 	}
 
 	/** A demo run in a scratch directory with simulated agents: no API calls, nothing stored. */
@@ -193,6 +230,7 @@ export function fleet(runs: Run[]): Snapshot | undefined {
 		goal: runs.length === 1 ? snaps[0].goal : `${live.length} of ${runs.length} runs going`,
 		tasks: snaps.flatMap((s) => s.tasks),
 		workers: snaps.flatMap((s) => s.workers),
+		nodes: snaps.flatMap((s) => s.nodes),
 		activity: [],
 		cost: snaps.reduce((n, s) => n + s.cost, 0),
 		planning: snaps.reduce((n, s) => n + (s.planning ?? 0), 0),

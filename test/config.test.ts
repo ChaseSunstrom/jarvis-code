@@ -3,7 +3,7 @@ import { appendFileSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { DEFAULTS, loadConfig, merge, trustProject, untrustProject } from '../src/config.js';
+import { DEFAULTS, loadConfig, merge, normalize, trustProject, untrustProject } from '../src/config.js';
 
 function sandbox() {
 	const root = mkdtempSync(join(tmpdir(), 'jc-config-'));
@@ -91,4 +91,33 @@ test('trust: an untrusted project config cannot choose commands; trusting allows
 	process.env.JARVIS_CODE_TRUST = 'all';
 	assert.equal(loadConfig(cwd).config.notify, 'x', 'JARVIS_CODE_TRUST=all, set by whoever runs jarvis-code');
 	delete process.env.JARVIS_CODE_TRUST;
+});
+
+test('routes config: role, task type and default keys map to route ids; type keys are stored uppercase', () => {
+	assert.deepEqual(DEFAULTS.routes, {});
+	const routes = (r: unknown) => normalize(merge(DEFAULTS, { routes: r })).routes;
+	const ok = { brainstorm: ['claude', 'codex'], workers: ['codex'], SECURITY: ['claude:claude-fable-5-1'], default: ['claude'] };
+	assert.deepEqual(routes(ok), ok);
+	assert.deepEqual(routes({ fix: ['codex'] }), { FIX: ['codex'] });
+	assert.throws(() => routes({ nope: ['claude'] }), /routes\.nope: a role/);
+	assert.throws(() => routes({ planner: 'claude' }), /routes\.planner: must be an array/);
+	assert.throws(() => routes({ critic: [''] }), /routes\.critic: must be an array/);
+	assert.throws(() => routes(['claude']), /routes: an object/);
+	const { cwd } = sandbox();
+	writeFileSync(join(cwd, '.jarvis-code.json'), JSON.stringify({ routes: { security: ['codex'] } }));
+	const l = loadConfig(cwd);
+	assert.deepEqual([l.config.routes, l.warnings], [{ SECURITY: ['codex'] }, []], 'not a command key: an untrusted project config may set it');
+});
+
+test('config keys: pipeline, intent and improve default to the highest setting and refuse bad values', () => {
+	assert.equal(DEFAULTS.planning.critique, true);
+	assert.equal(DEFAULTS.planning.coverage, true);
+	assert.equal(DEFAULTS.intent, true);
+	assert.deepEqual(DEFAULTS.improve, { rounds: 3, minLanded: 1 });
+	assert.ok(DEFAULTS.planning.lenses.some((l) => l.startsWith('unstated needs')));
+	for (const over of [{ planning: { critique: 'yes' } }, { planning: { coverage: 1 } }, { intent: null }])
+		assert.throws(() => normalize(merge(DEFAULTS, over)), /true or false/);
+	for (const rounds of [0, 1.5, '2']) assert.throws(() => normalize(merge(DEFAULTS, { improve: { rounds } })), /improve\.rounds/);
+	for (const minLanded of [-1, 0.5]) assert.throws(() => normalize(merge(DEFAULTS, { improve: { minLanded } })), /improve\.minLanded/);
+	assert.deepEqual(normalize(merge(DEFAULTS, { improve: { rounds: 1, minLanded: 0 }, intent: false })).improve, { rounds: 1, minLanded: 0 });
 });

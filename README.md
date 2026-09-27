@@ -37,6 +37,7 @@ jarvis-code status                                            # queue + agent he
 jarvis-code tasks                                             # the queue; `task add|show|retry|defer|drop|approve`
 jarvis-code status --all --json                               # every project's queue, for scripts
 jarvis-code learn                                             # what it has learned; `learn reset [KEY]`
+jarvis-code intent                                            # what you asked for and turned down; `intent reset`
 ```
 
 Bare `jarvis-code` opens the **cockpit**: every project it has tasks for or was used in, their
@@ -47,6 +48,8 @@ projects can run at once. `/` opens the command menu:
 |---|---|
 | `/run <goal>` · `/brainstorm <goal>` · `/work` | plan and work a goal · explore ideas first · work the open tasks |
 | `/improve [focus]` | find and make the most valuable improvements to the selected project, brainstormed first |
+| `/queue` · `/unqueue <n>` | a goal typed while the project's run is going waits in its queue (as a plain goal, even from `/brainstorm`) and starts when the run ends; the run's status line shows what is next · list them · take one off |
+| `/tell <id> <note>` | a note for a task's next attempt: to the live run, else kept as the task's hint |
 | `/open [project]` · `/home` · `/cd <project>` · `/add <dir>` | move between projects and runs |
 | `/stop [all]` · `/pause` | stop a run (kills its workers; also a background run of the selected project) · finish running tasks, start no new ones |
 | `/detach` | hand the selected project's run to the background: it keeps going after you quit |
@@ -54,6 +57,8 @@ projects can run at once. `/` opens the command menu:
 | `/trust <route or tool>` | forget what was learned about it, so it is used again |
 | `/report` | the run's report: every task's outcome, what was learned and found |
 | `/reports` | this project's past run reports, newest first |
+| `/graph` · `/tree` | in a run: its planning pipeline and every agent run in it · its tasks by dependency (Esc closes) |
+| `/diff [task]` | a task's last patch, coloured (the selected or open task by default); PgUp/PgDn scroll, Esc closes |
 | `/diffs` · `/tools` · `/messages` | show file changes, tool calls, agent messages (all off by default) |
 | `/learned` · `/reactor` · `/help` · `/quit` | learned routes and tools · reactor size · every command · exit |
 
@@ -78,6 +83,11 @@ carries the same facts as `died` and `lastEventAt` fields, for scripts.
 
 `--budget USD` and `--max-minutes N` cap one run: past either, jarvis-code stops dispatching and
 kills its workers, and the unfinished tasks stay queued for `jarvis-code work`.
+
+`improve --plain` (and `improve --detach`) runs rounds: each is an ordinary run whose goal names
+what the last round closed and asks for what comes next. `--rounds N` caps them (default 3) and
+`--min K` ends the loop after a round that lands fewer than K tasks (default 1); a stopped or
+capped run ends it too. Each round's outcome and the reason the loop ended are printed.
 
 Every run keeps a markdown report with the project's tasks (`--plain` prints its path), rewritten
 as each task finishes so a run that is killed partway still leaves one behind. When a task needs
@@ -171,8 +181,15 @@ written:
    writer suggests) runs as its own agent session, spread across your agents so different
    models take different angles. Every round sees all the ideas so far and has to go past them.
    Rounds stop when one adds fewer than `minNew` new ideas, or after `rounds`.
+   Brainstormers read the code their ideas touch, read-only (Claude Code without its edit tools,
+   Codex in `--sandbox read-only`, OpenCode's `plan` agent), and cite a file per idea. A `generic`
+   agent has no read-only mode, so as a brainstormer it can change files.
 3. **Planner.** It runs on a different agent from the prompt writer when you have one. It gets
    the prompt and the ideas, keeps the best value for the effort, and plans that.
+4. **Coverage** (`planning.coverage`). Once the tasks settle, an agent on a reviewer route checks
+   each done item (the prompt writer's, plus the goal's `DONE-WHEN:` lines) against what landed.
+   Unmet items are planned into follow-up tasks and worked in the same run, once. `/graph` lists
+   each item under the goal as met, unmet or open, with the tasks that cover it.
 
 Both the prompt writer and the planner start from facts jarvis-code gathers itself: the
 top-level layout, the README's first lines, build and test scripts, recent commits, tasks already
@@ -219,6 +236,25 @@ jarvis-code learn                  # routes and tools, scores, what is off and w
 jarvis-code learn reset local:ollama/qwen3-coder
 ```
 
+### Intent memory
+
+jarvis-code keeps a short record of what you ask for and turn down, across projects, so later
+plans lean toward what you want. It stores only what you did: the goals you type and the tasks you
+drop or approve, each with the time and the project's directory name. It never stores agent
+output, so no repository can write itself into every later project's prompts. Secrets (API keys
+and other long tokens) are redacted, your home directory is written as `~`, and each entry is
+capped at 300 characters.
+
+It is one append-only file, `intent.jsonl`, in the state dir (`~/.local/state/jarvis-code` by
+default; `JARVIS_CODE_STATE` moves it), trimmed to the newest 500 entries as it grows.
+
+```sh
+jarvis-code intent                 # recent asks and drops, per project
+jarvis-code intent reset           # forget all of it
+```
+
+`"intent": false` in the config turns it off, so nothing new is recorded.
+
 ### Model downgrades
 
 Claude Code sometimes moves a session to a fallback model when a message is flagged (Fable → Opus,
@@ -254,12 +290,15 @@ the defaults. Objects merge, arrays replace. `jarvis-code config init` writes a 
   },
   "workers": ["local:ollama/qwen3-coder", "claude:claude-fable-5-1", "codex"],  // preference order
   "planner": ["claude:claude-fable-5-1"],
+  // keys: a task type (workers only), a role (promptWriter · brainstorm · critic · planner · reviewer · workers) or "default".
+  // Each role takes the first level with an enabled agent: task type → role → planner/workers list (brainstorm and reviewer: both) → default → every enabled agent
+  "routes": { "SECURITY": ["codex"], "brainstorm": ["claude", "codex"] },
   "strategy": "priority",          // "best": highest learned score (for the task's type once known) · "escalate": workers listed cheapest → strongest
   "maxAttempts": 3,
   "maxParallel": 1,                // >1 runs workers side by side, each in its own git worktree
   "worktrees": true,               // false: parallel workers share the one working tree
   "verify": { "timeoutSec": 600, "preflight": true, "final": false },  // preflight: run every criterion's check on the untouched tree first, so the worker knows what already passes · final: after the last task, rerun the checks of every task closed in the run and report any that now fail
-  "ui": { "showDiffs": false, "showTools": false, "showText": false, "reactor": "large", "reactorStyle": "blocks", "fps": 24, "reducedMotion": false },
+  "ui": { "showDiffs": false, "showTools": false, "showText": false, "reactor": "large", "reactorStyle": "blocks", "icons": "text", "fps": 24, "reducedMotion": false },
   "learning": { "minSamples": 3, "disableBelow": 0.35, "cooldownMin": 1440, "decay": 0.9, "blockTools": true, "neverBlock": [] },
   "downgrade": {
     "default": { "action": "reupgrade", "max": 3 },
@@ -269,7 +308,15 @@ the defaults. Objects merge, arrays replace. `jarvis-code config init` writes a 
   "replan": true,                  // split a blocked task once into smaller ones
   "notify": "",                    // e.g. "notify-send jarvis-code \"$1\"": run when a task blocks and when a run ends
   "budget": { "usd": 0, "minutes": 0 },  // per run, 0 = no cap; over a cap the run stops and kills its workers
-  "planning": { "mode": "auto", "lenses": ["user value", "reliability", "simplicity", "bold bets"], "rounds": 3, "minNew": 3, "parallel": 4 }
+  "planning": {
+    "mode": "auto",
+    "lenses": ["user value", "reliability", "simplicity", "bold bets", "unstated needs (what the user will want next without saying it)"],
+    "rounds": 3, "minNew": 3, "parallel": 4,
+    "critique": true,              // a critic on another agent scores and ranks the ideas before the planner sees them
+    "coverage": true               // at the end of a run, check the goal's done-items against what landed and queue work for the gaps
+  },
+  "intent": true,                  // remember (redacted, across projects) what you ask for and turn down, so later plans lean your way
+  "improve": { "rounds": 3, "minLanded": 1 }  // improve runs up to `rounds` plan-and-work rounds; one landing fewer than `minLanded` tasks ends it
 }
 ```
 
@@ -333,7 +380,7 @@ Code's stream-json protocol, including its model-switch timing.
 - Learned tool blocking is enforced by the plugin. Claude Code workers always load it; Codex and
   OpenCode only have it after `jarvis-code plugin install codex|opencode` (`doctor` warns when
   it's missing). Without it those agents are told which tools are off, but nothing stops them.
-- Brainstorming costs one agent session per angle per round (4–7 angles, up to 3 rounds by
+- Brainstorming costs one agent session per angle per round (5–8 angles, up to 3 rounds by
   default). On metered APIs lower `planning.rounds` or `lenses`, or plan `direct`.
 - Downgrade detection is structured for Claude Code only. Codex and OpenCode don't report a model
   switch in their event streams.

@@ -1,14 +1,14 @@
 import type { Config } from './config.js';
 import type { Activity, Orchestrator } from './orchestrator.js';
 import { colorDepth, paint, palette } from './theme.js';
-import { clock, elapsed, KIND, visible } from './tui/style.js';
+import { clock, elapsed, kindMark, visible } from './tui/style.js';
 
 /** Line-per-event output for pipes, CI and `--plain`: the same feed the TUI shows. */
 export function attachPlain(o: Orchestrator, ui: Config['ui'], out: NodeJS.WriteStream = process.stdout): () => void {
 	const depth = colorDepth(process.env, !!out.isTTY);
 	const line = (a: Activity) => {
 		if (!visible(a, ui)) return;
-		const [icon, tone] = KIND[a.kind];
+		const [icon, tone] = kindMark(a.kind, ui.icons);
 		out.write(`${paint(clock(a.at), palette.textFaint, 1, depth)} ${paint(icon, palette[tone], 1, depth)} ${a.text}\n`);
 		if (a.kind === 'change' && a.detail) for (const l of a.detail.split('\n').slice(0, 6)) out.write(`           ${l}\n`);
 	};

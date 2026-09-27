@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { DEFAULTS, merge, type Config } from '../src/config.js';
 import { decide } from '../src/downgrade.js';
-import { choose, kindSummary, Learning, learnable, pick, routesFor } from '../src/learn.js';
+import { choose, kindSummary, Learning, learnable, pick, routesFor, type Role } from '../src/learn.js';
 
 function fresh(now = { t: Date.parse('2026-09-27T00:00:00Z') }) {
 	const file = join(mkdtempSync(join(tmpdir(), 'jc-learn-')), 'learning.json');
@@ -136,4 +136,25 @@ test('task type: kindSummary lists each type record of a route', () => {
 	l.recordKind('claude', 'PERF', true);
 	l.recordKind('claude', 'SECURITY', false);
 	assert.equal(kindSummary(l, 'claude'), 'FEATURE 5/6, FIX 3/4, CLEAN 1/2, PERF 1/1', 'most runs first, at most 4');
+});
+
+test('routes resolve: using, the task type (workers only), the role, the legacy lists, default, then every enabled agent', () => {
+	const agents = { claude: { enabled: true }, codex: { enabled: true }, opencode: { enabled: false } };
+	const ids = (cfg: Config, role: Role, opts: { type?: string; using?: string[] } = {}) => routesFor(cfg, role, (a) => a.enabled === true, opts).map((r) => r.id);
+	const cfg = config({
+		agents,
+		planner: ['codex'],
+		workers: ['claude', 'codex'],
+		routes: { SECURITY: ['codex'], FIX: ['opencode'], critic: ['claude'], brainstorm: ['nope'], default: ['claude'] },
+	});
+	assert.deepEqual(ids(cfg, 'worker', { using: ['opencode', 'claude', 'codex'], type: 'SECURITY' }), ['claude', 'codex'], 'using first, disabled dropped');
+	assert.deepEqual(ids(cfg, 'worker', { type: 'security' }), ['codex'], 'the task type');
+	assert.deepEqual(ids(cfg, 'worker', { type: 'FIX' }), ['claude', 'codex'], 'a disabled type route falls through to the workers list');
+	assert.deepEqual(ids(cfg, 'critic', { type: 'SECURITY' }), ['claude'], 'the role; a type route is for workers only');
+	assert.deepEqual(ids(cfg, 'planner', { type: 'FIX' }), ['codex'], 'legacy planner list');
+	assert.deepEqual(ids(cfg, 'brainstorm'), ['codex', 'claude'], 'an unknown agent falls through to both lists, deduped');
+	assert.deepEqual(ids(cfg, 'reviewer'), ['codex', 'claude']);
+	assert.deepEqual(ids(config({ agents, workers: ['claude'], routes: { workers: ['codex'] } }), 'worker'), ['codex'], 'routes.workers beats the workers list');
+	assert.deepEqual(ids(config({ agents, routes: { default: ['codex'] } }), 'promptWriter'), ['codex'], 'default');
+	assert.deepEqual(ids(config({ agents, routes: { default: ['opencode'] } }), 'worker'), ['claude', 'codex'], 'every enabled agent last');
 });

@@ -5,18 +5,20 @@
  * moment and satisfies the `test -f PATH` checks named in its prompt.
  *
  * As a prompt writer it calls goals with open-ended words "open"; as a brainstormer it gives
- * fewer new ideas each round (3, 2, 1, then none), like a real brainstorm running dry.
+ * fewer new ideas each round (3, 2, 1, then none), like a real brainstorm running dry; as a
+ * critic it scores later ideas higher, so ranking visibly reorders them.
  *
  * Env: JC_DEMO_PACE — ms per step (default 450) · JC_DEMO_PLAN — plan JSON to answer with ·
  * JC_DEMO_REVIEW=changes-first — as a reviewer, ask for changes until the diff shows a
  * `.reviewed` marker (which a worker writes when its prompt carries review findings) ·
  * JC_DEMO_REPLAN — plan JSON to answer a re-plan with (default: cannot split) ·
  * JC_DEMO_PLAN_FIXED — plan JSON to answer when asked to fix a plan's problems ·
- * JC_DEMO_KIND=open|concrete — force the prompt writer's call · JC_DEMO_BREAK=prompt,ideas —
+ * JC_DEMO_KIND=open|concrete — force the prompt writer's call · JC_DEMO_BREAK=prompt,ideas,critique —
  * answer those stages with prose instead of JSON · JC_DEMO_NOTES=1 — the first
  * task reports a lesson and a follow-up · JC_DEMO_LOG — append every prompt to this file ·
  * JC_DEMO_DOWNGRADE=1|some — a model named *fable* is downgraded once per session (`some`:
  * every third task); like the real CLI, a switch back applies from the next turn. A model named *flaky* never satisfies its checks (a weak local model).
+ * JC_DEMO_UNMET=n[,m] — as a coverage check, call those done items unmet (default: every item met).
  */
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -27,6 +29,8 @@ const PLAN_MARKER = 'JARVIS-CODE PLAN';
 const PROMPT_MARKER = 'JARVIS-CODE PROMPT';
 const IDEAS_MARKER = 'JARVIS-CODE IDEAS';
 const REVIEW_MARKER = 'JARVIS-CODE REVIEW';
+const CRITIQUE_MARKER = 'JARVIS-CODE CRITIQUE';
+const COVERAGE_MARKER = 'JARVIS-CODE COVERAGE';
 const argv = process.argv.slice(2);
 const stream = argv.includes('--input-format');
 const argOf = (name: string) => {
@@ -107,6 +111,21 @@ async function work(prompt: string): Promise<{ ok: boolean; text: string }> {
 	const broken = (stage: string) => (process.env.JC_DEMO_BREAK ?? '').split(',').includes(stage);
 	if (prompt.includes(PROMPT_MARKER) && broken('prompt')) return { ok: true, text: 'I looked around; the goal seems fine.' };
 	if (prompt.includes(IDEAS_MARKER) && broken('ideas')) return { ok: true, text: 'Some thoughts: make it faster.' };
+	if (prompt.includes(CRITIQUE_MARKER)) {
+		await tool('Read', { file_path: 'src/config.ts' });
+		if (broken('critique')) return { ok: true, text: 'They all look reasonable to me.' };
+		const scores = [...prompt.matchAll(/^(\d+)\. /gm)].map((m) => Number(m[1])).map((n) => ({ n, value: Math.min(5, n), effort: 2, risk: 1, note: 'checked against src/config.ts' }));
+		return { ok: true, text: JSON.stringify({ scores }) };
+	}
+	if (prompt.includes(COVERAGE_MARKER)) {
+		await tool('Read', { file_path: 'src/config.ts' });
+		const unmet = (process.env.JC_DEMO_UNMET ?? '').split(',').map(Number);
+		const landed = [...prompt.matchAll(/^- ([A-Z]+-\d+) /gm)].map((m) => m[1]);
+		const items = [...prompt.matchAll(/^(\d+)\. /gm)].map((m) => Number(m[1])).map((n) =>
+			unmet.includes(n) ? { n, met: false, tasks: [], missing: 'no task covers it yet' } : { n, met: true, tasks: landed, missing: '' },
+		);
+		return { ok: true, text: JSON.stringify({ items }) };
+	}
 	if (prompt.includes(REVIEW_MARKER)) {
 		await tool('Read', { file_path: 'src/config.ts' });
 		const addressed = /\.reviewed\b/.test(prompt);
@@ -119,7 +138,8 @@ async function work(prompt: string): Promise<{ ok: boolean; text: string }> {
 		const goal = prompt.match(/Goal, in the user's words: (.*)/)?.[1] ?? '';
 		const kind = process.env.JC_DEMO_KIND ?? (/\b(improve|better|modernize|polish|features|ideas)\b/i.test(goal) ? 'open' : 'concrete');
 		const brief = `Goal: ${goal}. The project builds with npm and tests with \`npm test\`; the change touches src/config.ts. Done when the tests pass.`;
-		return { ok: true, text: JSON.stringify({ brief, kind, lenses: ['developer experience'] }) };
+		const done = ['the settings load from src/config.ts', 'npm test passes', 'the README documents the settings'];
+		return { ok: true, text: JSON.stringify({ brief, kind, lenses: ['developer experience'], done }) };
 	}
 	if (prompt.includes(IDEAS_MARKER)) {
 		await tool('Read', { file_path: 'README.md' });

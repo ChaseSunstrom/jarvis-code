@@ -3,12 +3,12 @@ import { basename } from 'node:path';
 import type { ReactElement } from 'react';
 import type { Config } from '../config.js';
 import type { Learning as LearningStore } from '../learn.js';
-import type { Activity, Snapshot, TaskStatus, TaskView, WorkerView } from '../orchestrator.js';
+import { roleOf, type Activity, type Snapshot, type TaskStatus, type TaskView, type WorkerView } from '../orchestrator.js';
 import { large, ring, spinner, WORDS, type ReactorState } from '../reactor.js';
 import { sameModel } from '../agents/types.js';
 import type { Project, StoredTask } from '../store.js';
 import { c, type ColorDepth } from '../theme.js';
-import { cap, clock, elapsed, KIND, ORDER, STATUS, visible, type View } from './style.js';
+import { cap, clock, elapsed, kindMark, ORDER, statusMark, visible, type View } from './style.js';
 
 /** States the reactor moves in; idle, stopped and offline are drawn still. */
 export const ANIMATED = new Set<ReactorState>(['thinking', 'tool', 'alert', 'attention', 'warming']);
@@ -122,7 +122,7 @@ export function queueOrder(tasks: TaskView[]): TaskView[] {
 }
 
 /** `planning`: what planning is doing, shown while there are no tasks yet. `selected`: a task id to mark and keep in view. */
-export function Tasks({ tasks, height, t, planning, top = 0, selected }: { tasks: TaskView[]; height: number; t: number; planning?: string; top?: number; selected?: string }) {
+export function Tasks({ tasks, height, t, planning, top = 0, selected, icons = 'text' }: { tasks: TaskView[]; height: number; t: number; planning?: string; top?: number; selected?: string; icons?: View['icons'] }) {
 	const sorted = queueOrder(tasks);
 	const selIndex = selected ? sorted.findIndex((x) => x.id === selected) : -1;
 	// Scrolled: a row each for what is above and below, so the list never pretends to be whole.
@@ -138,13 +138,13 @@ export function Tasks({ tasks, height, t, planning, top = 0, selected }: { tasks
 			{shown.length ? null : <Text color={c.textFaint}>{planning ? `${planning}…` : 'nothing queued'}</Text>}
 			{first > 0 ? <Text color={c.textFaint}>{`  … ${first} above`}</Text> : null}
 			{shown.map((task) => {
-				const [icon, key] = STATUS[task.status];
+				const [icon, key] = statusMark(task.status, icons);
 				const color = c[key];
 				const isSel = task.id === selected;
 				return (
 					<Text key={task.id} wrap="truncate-end">
 						<Text color={isSel ? c.accent : c.line}>{isSel ? '▌' : ' '}</Text>
-						<Text color={color}>{task.status === 'running' ? spinner(t) : icon}</Text>
+						<Text color={color}>{task.status === 'running' && icons === 'glyph' ? spinner(t) : icon}</Text>
 						<Text color={c.textDim}>{` ${task.id} `}</Text>
 						<Text color={task.status === 'done' ? c.textDim : c.text} bold={isSel}>{task.title}</Text>
 						{task.attempts > 1 && task.status !== 'done' ? <Text color={c.warn}>{` ×${task.attempts}`}</Text> : null}
@@ -175,13 +175,17 @@ export function Workers({ workers, t, height }: { workers: WorkerView[]; t: numb
 				const reviewing = w.phase === 'reviewing';
 				// Planning stages have no task id: a brainstormer shows its angle and round.
 				const label = w.task.startsWith('ideas:') ? w.title : reviewing ? `review ${w.task}` : w.task;
+				// An agent that has said nothing for a while says so; past two minutes it may be stuck.
+				const quiet = Date.now() - (w.lastAt ?? w.started);
 				return (
 					<Box key={w.key} flexDirection="column">
 						<Text wrap="truncate-end">
 							<Text color={w.phase === 'verifying' ? c.accentLift : c.accent}>{w.phase === 'verifying' ? '◎' : spinner(t)}</Text>
+							<Text color={c.textDim}>{` ${roleOf(w.key)}`}</Text>
 							<Text color={c.textBright}>{` ${label} `}</Text>
 							<Text color={c.accentDeep}>{w.route}</Text>
 							{drifted ? <Text color={c.warming}>{` ⇅ ${w.model}`}</Text> : null}
+							{quiet > 30_000 ? <Text color={quiet > 120_000 ? c.warn : c.textFaint}>{`  quiet ${elapsed(quiet)}`}</Text> : null}
 							{roomy ? <Text color={c.textDim}>{`  ${elapsed(Date.now() - w.started)} · ${w.tools} tools${w.cost ? ` · $${w.cost.toFixed(2)}` : ''}`}</Text> : <Text color={c.textFaint}>{`  ${doing}`}</Text>}
 						</Text>
 						{roomy ? <Text color={c.textFaint} wrap="truncate-end">{`  └ ${doing}`}</Text> : null}
@@ -302,7 +306,7 @@ export function Feed({ activity, v, height, back = 0 }: { activity: Activity[]; 
 	for (let i = activity.length - 1; i >= 0 && lines.length < want; i--) {
 		const a = activity[i];
 		if (!visible(a, v)) continue;
-		const [icon, key] = KIND[a.kind];
+		const [icon, key] = kindMark(a.kind, v.icons);
 		const color = c[key];
 		const detail =
 			a.kind === 'change' && a.detail
