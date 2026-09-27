@@ -1,39 +1,54 @@
 #!/usr/bin/env node
-import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { agentEnabled, DEFAULTS, loadConfig, merge, normalize, onPath, paths, type Config } from './config.js';
+import { agentEnabled, DEFAULTS, loadConfig, merge, normalize, onPath, paths, trustProject, untrustProject, type Config } from './config.js';
 import { Learning, routesFor, score } from './learn.js';
 import { Orchestrator } from './orchestrator.js';
+import { improveGoal } from './pipeline.js';
 import { attachPlain } from './plain.js';
 import { install, installed, PLUGIN_DIR, ROOT, TARGETS, uninstall, type Target } from './plugin.js';
-import { ForemanSource, MemorySource, type TaskSource } from './tasks.js';
+import { RunManager, demoConfig, runDetached, stopElsewhere, type Run } from './runs.js';
+import { BULK, decideTask, DECISIONS, listStored, nextStep, Project, TYPES, type Decision, type Status, type StoredTask } from './store.js';
+import { MemorySource, StoreSource, type TaskSource } from './tasks.js';
 import { colorDepth, paint, palette } from './theme.js';
 
 const VERSION = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version as string;
 
-const HELP = `jarvis-code ${VERSION} — Foreman-driven orchestration for Claude Code, Codex, OpenCode and other agents
+const HELP = `jarvis-code ${VERSION} — orchestration for Claude Code, Codex, OpenCode and other coding agents
 
 Usage
-  jarvis-code "<goal>"            plan the goal into Foreman tasks, then work them (TUI)
-  jarvis-code work                work the existing Foreman queue, no planning
+  jarvis-code                     the cockpit: every project, runs, a prompt for goals and /commands
+  jarvis-code "<goal>"            plan the goal into tasks, then work them (opens the cockpit on the run)
+  jarvis-code work                work this project's open tasks, no planning
+  jarvis-code improve [focus]     find and make the most valuable improvements here (brainstormed first)
   jarvis-code demo                simulated agents: see the TUI, learning and re-upgrades (no API calls)
   jarvis-code status              the queue, the agents and their learned health
+  jarvis-code stop                end this project's background or CLI run
+  jarvis-code tasks [--all]       this project's tasks (--all includes done and dropped)
+  jarvis-code task add "<title>" [--type T] [--tier S|M|L] [--ac "<done when> :: <verify cmd>"]...
+  jarvis-code task show|retry|defer|drop|approve ID|blocked|review [why]
+  jarvis-code status --all [--json]   every project's queue (JSON for scripts)
   jarvis-code learn [reset [KEY]] what was learned about routes and tools; forget it
-  jarvis-code config [show|path|init [--project]]
+  jarvis-code config [show|path|init [--project]|trust|untrust]
   jarvis-code plugin <install|uninstall|status> [claude|codex|opencode]
-  jarvis-code doctor              check agents, Foreman, plugin and terminal
+  jarvis-code doctor              check agents, plugin and terminal
 
 Options
   --plain                 line output instead of the TUI (automatic when not a terminal)
-  --tasks foreman|memory  task backend (default: foreman when \`fm\` is installed)
+  --detach                run in the background (a goal, work or improve); the log is kept with the tasks
+  --tasks store|memory    where tasks live (default: store, jarvis-code's own per-project state)
+  --planning MODE         auto: a prompt writer grounds the goal, open goals are brainstormed first (default)
+                          direct: one planner · deep: always brainstorm
   --worker ROUTE          worker route, repeatable, in preference order (agent or agent:model)
   --planner ROUTE         planner route, repeatable
   --parallel N            workers at once (default 1; >1 shares one working tree)
   --attempts N            attempts per task across routes (default 3)
+  --budget USD            stop the run once it has cost this much (kills its workers)
+  --max-minutes N         stop the run after N minutes
   --show-diffs --show-tools --show-text   feed detail (off by default)
   --reactor large|small|off   --reduced-motion   --cwd DIR
   --fast                  demo: run at test speed
@@ -57,10 +72,14 @@ async function main(argv: string[]) {
 			options: {
 				plain: { type: 'boolean' },
 				tasks: { type: 'string' },
+				planning: { type: 'string' },
 				worker: { type: 'string', multiple: true },
 				planner: { type: 'string', multiple: true },
 				parallel: { type: 'string' },
 				attempts: { type: 'string' },
+				budget: { type: 'string' },
+				'max-minutes': { type: 'string' },
+				detach: { type: 'boolean' },
 				'show-diffs': { type: 'boolean' },
 				'show-tools': { type: 'boolean' },
 				'show-text': { type: 'boolean' },
@@ -69,6 +88,11 @@ async function main(argv: string[]) {
 				cwd: { type: 'string' },
 				fast: { type: 'boolean' },
 				project: { type: 'boolean' },
+				all: { type: 'boolean' },
+				json: { type: 'boolean' },
+				type: { type: 'string' },
+				tier: { type: 'string' },
+				ac: { type: 'string', multiple: true },
 				help: { type: 'boolean', short: 'h' },
 				version: { type: 'boolean', short: 'v' },
 			},
@@ -86,12 +110,20 @@ async function main(argv: string[]) {
 		if (!Number.isInteger(n) || n < 1) die(`--${name} must be a positive integer`);
 		return n;
 	};
+	const positive = (v: string, name: string) => {
+		const n = Number(v);
+		if (!(n > 0)) die(`--${name} must be a number above 0`);
+		return n;
+	};
 	if (f.reactor && !['large', 'small', 'off'].includes(f.reactor)) die('--reactor must be large, small or off');
+	if (f.planning && !['auto', 'direct', 'deep'].includes(f.planning)) die('--planning must be auto, direct or deep');
 	const overrides = {
 		...(f.worker && { workers: f.worker }),
 		...(f.planner && { planner: f.planner }),
 		...(f.parallel && { maxParallel: int(f.parallel, 'parallel') }),
 		...(f.attempts && { maxAttempts: int(f.attempts, 'attempts') }),
+		...(f.planning && { planning: { mode: f.planning } }),
+		...((f.budget || f['max-minutes']) && { budget: { ...(f.budget && { usd: positive(f.budget, 'budget') }), ...(f['max-minutes'] && { minutes: positive(f['max-minutes'], 'max-minutes') }) } }),
 		ui: {
 			...(f['show-diffs'] && { showDiffs: true }),
 			...(f['show-tools'] && { showTools: true }),
@@ -102,18 +134,28 @@ async function main(argv: string[]) {
 	};
 	let config: Config;
 	let sources: string[];
+	let warnings: string[];
 	try {
-		({ config, sources } = loadConfig(cwd, overrides));
+		({ config, sources, warnings } = loadConfig(cwd, overrides));
 	} catch (e) {
 		die((e as Error).message);
 	}
+	if (pos[0] !== 'config') for (const w of warnings) process.stderr.write(`${tone('jarvis-code', 'warn')}: ${w}\n`);
 
 	const [cmd, ...rest] = pos;
+	const tui = !f.plain && !!process.stdout.isTTY && !!process.stdin.isTTY;
 	switch (cmd) {
 		case 'demo':
-			return demo(config, !!f.plain, !!f.fast);
+			if (tui) return cockpit(config, cwd, overrides, (m) => m.startDemo(!!f.fast), !!f.fast);
+			return demo(config, !!f.fast);
 		case 'status':
-			return status(config, cwd);
+			return f.all ? statusAll(!!f.json) : status(config, cwd);
+		case 'stop':
+			return stopCmd(cwd);
+		case 'tasks':
+			return tasksCmd(cwd, !!f.all);
+		case 'task':
+			return taskCmd(cwd, rest, { type: f.type, tier: f.tier, ac: f.ac });
 		case 'learn':
 			return learn(config, rest);
 		case 'config':
@@ -124,92 +166,159 @@ async function main(argv: string[]) {
 			return doctor(config, cwd, sources);
 		case 'help':
 			return say(HELP);
+		case 'improve': {
+			const goal = improveGoal(rest.join(' ') || undefined);
+			const deep = { planning: { mode: 'deep' } };
+			if (f.detach) return detach(cwd, argv, f.tasks);
+			if (tui) return cockpit(config, cwd, overrides, (m) => m.start(cwd, { goal, overrides: deep }));
+			return run(normalize(merge(config, deep)), cwd, goal, f.tasks);
+		}
 		case 'work':
-			return run(config, cwd, undefined, f.tasks, !!f.plain);
 		case 'run':
-			return run(config, cwd, rest.join(' ') || undefined, f.tasks, !!f.plain);
 		case undefined:
-			return say(HELP);
-		default:
-			return run(config, cwd, pos.join(' '), f.tasks, !!f.plain);
-	}
-}
-
-function source(config: Config, cwd: string, kind: string | undefined, log: (s: string) => void): TaskSource {
-	const want = kind ?? (onPath(config.foreman.bin) ? 'foreman' : 'memory');
-	if (want === 'memory') return new MemorySource(cwd, config.verify.timeoutSec);
-	if (want !== 'foreman') die('--tasks must be foreman or memory');
-	if (!onPath(config.foreman.bin)) die(`Foreman (\`${config.foreman.bin}\`) is not on PATH: install it (https://github.com/ChaseSunstrom/foreman) or pass --tasks memory`);
-	return new ForemanSource(config.foreman.bin, cwd, config.verify.timeoutSec, log);
-}
-
-async function run(config: Config, cwd: string, goal: string | undefined, tasks: string | undefined, plain: boolean) {
-	if (!goal && tasks === 'memory') die('nothing to work: the memory queue starts empty, give a goal');
-	let o!: Orchestrator;
-	const src = source(config, cwd, tasks, (s) => o?.note('info', s));
-	if (src instanceof ForemanSource) {
-		try {
-			await src.init();
-		} catch (e) {
-			die((e as Error).message, 1);
+		default: {
+			const goal = cmd === 'work' || cmd === undefined ? undefined : (cmd === 'run' ? rest : pos).join(' ') || undefined;
+			if (f.detach && cmd !== undefined) return detach(cwd, argv, f.tasks);
+			if (tui) {
+				if (f.tasks && f.tasks !== 'store' && f.tasks !== 'memory') die('--tasks must be store or memory');
+				const memory = f.tasks === 'memory';
+				if (cmd === undefined) return cockpit(config, cwd, overrides);
+				return cockpit(config, cwd, overrides, (m) => m.start(cwd, { goal, memory }));
+			}
+			if (cmd === undefined) return say(HELP);
+			return run(config, cwd, goal, f.tasks);
 		}
 	}
-	// Workers load this package's plugin per session unless it is installed for good.
-	const pluginDir = installed.claude() ? undefined : PLUGIN_DIR;
-	o = new Orchestrator(config, src, new Learning(config.learning), cwd, { pluginDir });
-	process.exitCode = await drive(o, config, goal, plain);
 }
 
-/** Run the orchestrator under the TUI (a terminal) or plain lines; the exit code says how it ended. */
-async function drive(o: Orchestrator, config: Config, goal: string | undefined, plain: boolean): Promise<number> {
-	const tty = !!process.stdout.isTTY && !!process.stdin.isTTY;
-	if (plain || !tty) {
-		const end = attachPlain(o, config.ui);
-		const done = o.run(goal);
-		const stop = () => o.stop();
-		process.once('SIGINT', stop);
-		process.once('SIGTERM', stop);
-		const r = await done;
-		end();
-		return r.blocked || r.review || o.snapshot().error ? 1 : 0;
+/**
+ * The cockpit: every project and run, a prompt for goals and commands. `start` opens it on a
+ * run (a goal, `work`, the demo); without it the cockpit opens on the project list.
+ */
+async function cockpit(config: Config, cwd: string, overrides: unknown, start?: (m: RunManager) => Run | Promise<Run>, fast = false) {
+	const manager = new RunManager(new Learning(config.learning), { overrides });
+	let focus: Run | undefined;
+	try {
+		focus = start ? await start(manager) : undefined;
+	} catch (e) {
+		die((e as Error).message, 1);
 	}
-	const done = o.run(goal);
-	const [{ render }, { createElement }, { App }] = await Promise.all([import('ink'), import('react'), import('./tui/App.js')]);
-	const ink = render(createElement(App, { o, config, depth, done }), {
+	const [{ render }, { createElement }, { Cockpit }] = await Promise.all([import('ink'), import('react'), import('./tui/Cockpit.js')]);
+	const ink = render(createElement(Cockpit, { manager, config, depth, focus, cwd, fast }), {
 		exitOnCtrlC: false,
 		alternateScreen: config.ui.alternateScreen,
 		incrementalRendering: true,
 		maxFps: Math.max(1, config.ui.fps),
 	});
 	await ink.waitUntilExit();
-	const r = await done;
-	const s = o.snapshot();
-	say(`${tone('jarvis-code', 'accent')}: ${r.done}/${s.tasks.length} done, ${r.blocked} blocked, ${r.review} to review · $${s.cost.toFixed(2)}`);
-	for (const t of s.tasks.filter((t) => t.status === 'blocked' || t.status === 'review')) say(`  ${tone(t.status === 'blocked' ? '⊘' : '◇', 'warn')} ${t.id} ${t.title}: ${t.note ?? ''}`);
-	return r.blocked || r.review || s.error ? 1 : 0;
+	await manager.stopAll();
+	let stuck = 0;
+	for (const r of manager.list()) {
+		const s = r.o.snapshot();
+		const n = (st: string) => s.tasks.filter((t) => t.status === st).length;
+		stuck += n('blocked') + n('review') + (s.error ? 1 : 0);
+		say(`${tone('jarvis-code', 'accent')} #${r.id} ${r.name}: ${n('done')}/${s.tasks.length} done, ${n('blocked')} blocked, ${n('review')} to review · $${s.cost.toFixed(2)}`);
+		for (const t of s.tasks.filter((t) => t.status === 'blocked' || t.status === 'review')) say(`  ${tone(t.status === 'blocked' ? '⊘' : '◇', 'warn')} ${t.id} ${t.title}: ${t.note ?? ''}`);
+	}
+	process.exitCode = stuck ? 1 : 0;
 }
 
-async function demo(base: Config, plain: boolean, fast: boolean) {
-	const agent = fileURLToPath(new URL('./demo-agent.js', import.meta.url));
-	const env = { JC_DEMO_PACE: fast ? '25' : '450', JC_DEMO_DOWNGRADE: 'some' };
-	const config = normalize(
-		merge(base, {
-			agents: {
-				claude: { kind: 'claude', enabled: true, bin: agent, models: ['claude-fable-5-1'], env, args: [], disablePlugins: [] },
-				codex: { enabled: false },
-				opencode: { enabled: false },
-				local: { kind: 'generic', enabled: true, bin: agent, args: ['--model', '{model}', '{prompt}'], models: ['qwen3-coder-flaky'], env },
-			},
-			planner: ['claude:claude-fable-5-1'],
-			workers: ['local:qwen3-coder-flaky', 'claude:claude-fable-5-1'],
-			maxParallel: 1,
-			downgrade: { models: { 'claude-fable*': { action: 'reupgrade', to: 'claude-fable-5-1', max: 3 } } },
-		}),
-	);
+function source(config: Config, cwd: string, kind: string | undefined): TaskSource {
+	const want = kind ?? 'store';
+	if (want === 'memory') return new MemorySource(cwd, config.verify.timeoutSec);
+	if (want !== 'store') die('--tasks must be store or memory');
+	return new StoreSource(new Project(cwd), cwd, config.verify.timeoutSec);
+}
+
+async function run(config: Config, cwd: string, goal: string | undefined, tasks: string | undefined) {
+	if (!goal && tasks === 'memory') die('nothing to work: the memory queue starts empty, give a goal');
+	const src = source(config, cwd, tasks);
+	// Workers load this package's plugin per session unless it is installed for good.
+	const pluginDir = installed.claude() ? undefined : PLUGIN_DIR;
+	const o = new Orchestrator(config, src, new Learning(config.learning), cwd, { pluginDir });
+	const project = src instanceof StoreSource ? src.project : undefined;
+	try {
+		project?.lock({ goal, log: process.env.JARVIS_CODE_LOG, by: 'cli' });
+	} catch (e) {
+		die((e as Error).message, 1);
+	}
+	try {
+		process.exitCode = await drive(o, config, goal);
+	} finally {
+		project?.unlock();
+	}
+}
+
+/** The same command again, in the background: it outlives this terminal, its output in the store. */
+async function detach(cwd: string, argv: string[], tasks?: string) {
+	if (tasks === 'memory') die('--detach keeps the queue in the task store: drop --tasks memory');
+	try {
+		const { pid, log } = await runDetached(cwd, argv.filter((a) => a !== '--detach'));
+		say(`${tone('jarvis-code', 'accent')}: running in the background (pid ${pid}). \`jarvis-code status\` here shows it, \`jarvis-code stop\` ends it.`);
+		say(tone(`log: ${log}`, 'textDim'));
+	} catch (e) {
+		die((e as Error).message, 1);
+	}
+}
+
+/** End this project's background or CLI run (a cockpit's run is stopped from its cockpit). */
+function stopCmd(cwd: string) {
+	const said = stopElsewhere(cwd);
+	if (said.startsWith('that run belongs')) die(said, 1);
+	say(said);
+}
+
+/** Run the orchestrator with plain line output; the exit code says how it ended. */
+async function drive(o: Orchestrator, config: Config, goal: string | undefined): Promise<number> {
+	const end = attachPlain(o, config.ui);
+	const done = o.run(goal);
+	const stop = () => o.stop();
+	process.once('SIGINT', stop);
+	process.once('SIGTERM', stop);
+	const r = await done;
+	end();
+	return r.blocked || r.review || o.snapshot().error ? 1 : 0;
+}
+
+async function demo(base: Config, fast: boolean) {
+	const config = demoConfig(base, fast);
 	const cwd = mkdtempSync(join(tmpdir(), 'jarvis-code-demo-'));
 	const learning = new Learning(config.learning, join(cwd, '.learning.json'));
 	const o = new Orchestrator(config, new MemorySource(cwd, 30), learning, cwd);
-	process.exitCode = await drive(o, config, 'Modernize the settings system', plain);
+	process.exitCode = await drive(o, config, 'Modernize the settings system');
+}
+
+/** A held run with no event past this long is likely a long check (no events emitted) or a stuck agent. */
+const QUIET_MS = 10 * 60_000;
+
+function ageStr(ms: number): string {
+	const s = Math.floor(ms / 1000);
+	if (s < 60) return `${s}s`;
+	const m = Math.floor(s / 60);
+	if (m < 60) return `${m}m`;
+	return `${Math.floor(m / 60)}h`;
+}
+
+/** One line per project jarvis-code has tasks for; `json` for scripts. */
+function statusAll(json: boolean) {
+	const rows = listStored().map((m) => {
+		const p = Project.open(m.path)!;
+		return { name: m.name, path: m.path, lastActive: m.lastActive, running: p.running(), died: !!p.died(), ...p.summary(), spent: p.spent(), lastEventAt: p.lastBeat() ? new Date(p.lastBeat()!.at).toISOString() : undefined };
+	});
+	if (json) return say(JSON.stringify(rows, null, 2));
+	if (!rows.length) return say('no projects yet: give jarvis-code a goal somewhere');
+	for (const r of rows) {
+		const stuck = r.blocked + r.review;
+		say(`  ${r.running ? tone('◠', 'accent') : stuck ? tone('⊘', 'warn') : r.planned + r.active ? tone('·', 'accent') : tone('✓', 'ok')} ${r.name.padEnd(24)} ${`${r.planned + r.active} open`.padEnd(8)} ${stuck ? tone(`${stuck} need you`, 'warn') : ''.padEnd(10)} ${tone(r.path, 'textDim')}`);
+	}
+}
+
+/** "off for 40m more (until 14:10): <reason> · jarvis-code learn reset <id> turns it back on now" */
+function offLine(st: { disabledUntil?: string; reason?: string }, id: string): string {
+	const until = new Date(st.disabledUntil!);
+	const mins = Math.ceil((until.getTime() - Date.now()) / 60_000);
+	const clock = `${String(until.getHours()).padStart(2, '0')}:${String(until.getMinutes()).padStart(2, '0')}`;
+	return `off for ${mins}m more (until ${clock})${st.reason ? `: ${st.reason}` : ''} · jarvis-code learn reset ${id} turns it back on now`;
 }
 
 async function status(config: Config, cwd: string) {
@@ -218,36 +327,126 @@ async function status(config: Config, cwd: string) {
 	for (const r of [...new Map([...routesFor(config, 'planner'), ...routesFor(config, 'worker')].map((r) => [r.id, r])).values()]) {
 		const st = learning.data.routes[r.id];
 		const off = learning.routeOff(r.id);
-		say(`  ${off ? tone('✕', 'danger') : tone('●', 'ok')} ${r.id}${st ? `  ${Math.round(score(st) * 100)}% · ${st.ok}/${st.runs} ok` : ''}${off ? `  off until ${st!.disabledUntil}` : ''}`);
+		say(`  ${off ? tone('✕', 'danger') : tone('●', 'ok')} ${r.id}${st ? `  ${Math.round(score(st) * 100)}% · ${st.ok}/${st.runs} ok` : ''}${off ? `  ${offLine(st!, r.id)}` : ''}`);
 	}
 	for (const [name, a] of Object.entries(config.agents)) if (!agentEnabled(a)) say(`  ${tone('○', 'textFaint')} ${name} (${a.enabled === 'auto' ? `\`${a.bin}\` not found` : 'disabled'})`);
-	if (!onPath(config.foreman.bin)) return say(`\n${tone('!', 'warn')} Foreman not installed: no queue to show`);
-	const src = new ForemanSource(config.foreman.bin, cwd, 60);
-	const q = await src.fm(['queue', '--json']);
-	if (q.code !== 0) return say(`\n${(q.stderr || q.stdout).trim()}`);
-	const order: { id: string; title: string; status: string; tier: string; type: string }[] = JSON.parse(q.stdout).order;
-	say(`\n${tone('Q U E U E', 'textDim')}  ${order.length} open`);
-	for (const t of order) say(`  ${t.status === 'active' ? tone('◠', 'accent') : tone('·', 'textFaint')} ${t.id} ${t.type} ${t.tier}  ${t.title}`);
+	const project = Project.open(cwd);
+	if (!project) return say(`\n${tone('·', 'textDim')} no tasks here yet: give jarvis-code a goal to plan some`);
+	const s = project.summary();
+	say(`\n${tone('Q U E U E', 'textDim')}  ${s.planned + s.active} open · ${s.blocked} blocked · ${s.review} to review · ${s.done} done`);
+	const held = project.running();
+	if (held) {
+		say(`  ${tone('◠', 'accent')} a run is going: pid ${held.pid} since ${held.started.slice(11, 16)} (${held.by === 'cockpit' ? 'in a cockpit' : held.log ? `in the background, log ${held.log}` : 'from the CLI'})`);
+		const beat = project.lastBeat();
+		if (beat) {
+			const age = Date.now() - beat.at;
+			if (age >= QUIET_MS) say(`    ${tone(`⚠ quiet for ${ageStr(age)} (a long check or a stuck agent)${beat.task ? ` on ${beat.task}` : ''}: ${beat.text}`, 'warn')}`);
+			else say(`    ${tone(`last event ${ageStr(age)} ago${beat.task ? ` on ${beat.task}` : ''}: ${beat.text}`, 'textDim')}`);
+		}
+	} else {
+		const dead = project.died();
+		if (dead) say(`  ${tone('⊘', 'warn')} the last run (pid ${dead.pid}, started ${dead.started.slice(11, 16)}${dead.log ? `, log ${dead.log}` : ''}) died with its lock held before finishing: \`jarvis-code work\` (or \`work --detach\`) resumes it, and its active tasks go back to the queue`);
+	}
+	for (const t of project.queue()) say(`  ${t.status === 'active' ? tone('◠', 'accent') : tone('·', 'textFaint')} ${t.id} ${t.type} ${t.tier}  ${t.title}`);
+	for (const t of project.tasks().filter((t) => t.status === 'blocked' || t.status === 'review')) {
+		say(`  ${tone(t.status === 'blocked' ? '⊘' : '◇', 'warn')} ${t.id} ${t.title}: ${t.reason ?? ''}`);
+		const next = nextStep(t);
+		if (next) say(tone(`      next: ${next}`, 'textDim'));
+	}
+}
+
+const MARK: Record<Status, [string, keyof typeof palette]> = {
+	planned: ['·', 'textFaint'],
+	active: ['◠', 'accent'],
+	review: ['◇', 'warn'],
+	blocked: ['⊘', 'warn'],
+	deferred: ['‥', 'textDim'],
+	done: ['✓', 'ok'],
+	dropped: ['✕', 'textFaint'],
+};
+
+const taskLine = (t: StoredTask) => `  ${tone(...MARK[t.status])} ${t.id} ${t.type} ${t.tier}  ${t.title}${t.reason ? tone(`  ${t.reason}`, 'textDim') : ''}`;
+
+function tasksCmd(cwd: string, all: boolean) {
+	const project = Project.open(cwd);
+	if (!project) return say('no tasks here yet: give jarvis-code a goal to plan some, or `jarvis-code task add`');
+	const queue = project.queue();
+	const rest = project.tasks().filter((t) => !queue.some((q) => q.id === t.id) && (all || !['done', 'dropped'].includes(t.status)));
+	for (const t of [...queue.map((q) => project.get(q.id)!), ...rest]) say(taskLine(t));
+	const s = project.summary();
+	say(tone(`\n${s.planned + s.active} open · ${s.blocked} blocked · ${s.review} to review · ${s.deferred} deferred · ${s.done} done`, 'textDim'));
+}
+
+function taskCmd(cwd: string, args: string[], f: { type?: string; tier?: string; ac?: string[] }) {
+	const [verb, id, ...why] = args;
+	if (verb === 'add') {
+		const title = args.slice(1).join(' ').trim();
+		if (!title) die('task add needs a title');
+		if (f.type && !TYPES.includes(f.type.toUpperCase())) die(`--type must be one of ${TYPES.join(', ')}`);
+		if (f.tier && !/^[sml]$/i.test(f.tier)) die('--tier must be S, M or L');
+		const acs = (f.ac ?? []).map((a) => {
+			const [text, verify] = a.split(' :: ');
+			return { text: text.trim(), verify: verify?.trim() };
+		});
+		const [t] = new Project(cwd).add([{ title, type: f.type, tier: f.tier, acs }]);
+		return say(`${tone('+', 'ok')} ${t.id} ${t.title}${acs.some((a) => a.verify) ? '' : tone('  (no verify command: a worker finishing it goes to review)', 'textDim')}`);
+	}
+	if (verb !== 'show' && !(verb in DECISIONS))
+		die(verb ? `unknown task verb "${verb}" (add, show, retry, defer, drop, approve); to plan a goal, quote it: jarvis-code "task ${args.join(' ')}"` : 'task needs a verb: add, show, retry, defer, drop or approve');
+	const project = Project.open(cwd);
+	if (!project) die(`no task ${id ?? ''} here`);
+	const bulk = verb !== 'show' && !!id && (BULK as readonly string[]).includes(id.toLowerCase());
+	const t = id && !bulk ? project.get(id.toUpperCase()) : undefined;
+	if (!bulk && !t) die(`no task ${id ?? ''} here`);
+	switch (verb) {
+		case 'show': {
+			say(taskLine(t!));
+			if (t!.goal) say(tone(`  goal: ${t!.goal}`, 'textDim'));
+			if (t!.brief) say(`  ${t!.brief}`);
+			for (const [i, a] of t!.acs.entries()) say(`  ${a.checked ? tone('✓', 'ok') : tone('○', 'textFaint')} AC${i + 1} ${a.text}${a.verify ? tone(`  $ ${a.verify}`, 'textDim') : ''}`);
+			for (const [i, st] of t!.steps.entries()) say(`  ${i + 1}. ${st}`);
+			if (t!.depends.length) say(tone(`  after ${t!.depends.join(', ')}`, 'textDim'));
+			for (const a of t!.attempts) say(`  ${a.ok ? tone('●', 'ok') : tone('✕', 'danger')} ${a.at.slice(0, 16).replace('T', ' ')} ${a.route}${a.error ? `: ${a.error}` : a.summary ? `: ${a.summary}` : ''}`);
+			for (const l of t!.lessons) say(`  ${tone('lesson', 'accent')} ${l}`);
+			const next = nextStep(t!);
+			if (next) say(`  ${tone('next', 'accent')}: ${next}`);
+			return;
+		}
+		default:
+			try {
+				return say(decideTask(project, verb as Decision, id!, why.join(' ')));
+			} catch (e) {
+				die((e as Error).message, 1);
+			}
+	}
 }
 
 function learn(config: Config, args: string[]) {
 	const learning = new Learning(config.learning);
 	if (args[0] === 'reset') {
-		learning.reset(args[1]);
+		const key = args.slice(1).join(' ');
+		const gone = key ? learning.forgive(key) : (learning.reset(), ['everything']);
 		learning.save();
-		return say(args[1] ? `forgot ${args[1]}` : 'forgot everything learned');
+		return say(gone.length ? `forgot ${gone.join(', ')}` : `nothing learned about ${key}`);
 	}
 	const { routes, tools } = learning.data;
-	const row = (k: string, st: (typeof routes)[string]) => {
+	// `label` is how the key reads; `key` is what `learn reset` takes (quoted when a shell would mangle it).
+	const row = (label: string, key: string, st: (typeof routes)[string]) => {
 		const off = learning.isOff(st);
-		say(`  ${off ? tone('✕', 'danger') : tone('●', 'ok')} ${k}  ${Math.round(score(st) * 100)}% · ${st.ok}/${st.runs} ok${off ? `  off until ${st.disabledUntil}: ${st.reason}` : ''}`);
+		const arg = /^[\w:.@/-]+$/.test(key) ? key : `'${key}'`;
+		say(`  ${off ? tone('✕', 'danger') : tone('●', 'ok')} ${label}  ${Math.round(score(st) * 100)}% · ${st.ok}/${st.runs} ok${off ? `  ${offLine(st, arg)}` : ''}`);
 	};
 	say(tone('R O U T E S', 'textDim'));
 	if (!Object.keys(routes).length) say('  nothing yet');
-	for (const [k, st] of Object.entries(routes)) row(k, st);
+	for (const [k, st] of Object.entries(routes)) row(k, k, st);
+	const kinds = Object.entries(learning.data.kinds);
+	if (kinds.length) {
+		say(tone('\nB Y   T A S K   T Y P E', 'textDim'));
+		for (const [k, st] of kinds) row(k.replace('@', ' @ '), k, st);
+	}
 	say(tone('\nT O O L S', 'textDim') + '  (per orchestrating agent)');
 	if (!Object.keys(tools).length) say('  nothing yet');
-	for (const [k, st] of Object.entries(tools)) row(k.replace('|', ' › '), st);
+	for (const [k, st] of Object.entries(tools)) row(k.replace('|', ' › '), k, st);
 }
 
 function configCmd(config: Config, sources: string[], cwd: string, args: string[], project: boolean) {
@@ -257,7 +456,18 @@ function configCmd(config: Config, sources: string[], cwd: string, args: string[
 		say(JSON.stringify(config, null, 2));
 		return process.stderr.write(`\n(merged from defaults${sources.length ? ' + ' + sources.join(' + ') : ''})\n`);
 	}
-	if (sub !== 'init') die(`config ${sub}: expected show, path or init`);
+	if (sub === 'trust') {
+		try {
+			return say(`trusted ${trustProject(cwd)}: the commands it names may run here, until the file changes`);
+		} catch (e) {
+			die((e as Error).message, 1);
+		}
+	}
+	if (sub === 'untrust') {
+		untrustProject(cwd);
+		return say(`${paths.projectConfig(cwd)} is no longer trusted`);
+	}
+	if (sub !== 'init') die(`config ${sub}: expected show, path, init, trust or untrust`);
 	const file = project ? paths.projectConfig(cwd) : paths.globalConfig();
 	if (existsSync(file)) die(`${file} already exists`, 1);
 	const starter = {
@@ -306,8 +516,6 @@ function doctor(config: Config, cwd: string, sources: string[]) {
 	};
 	const warn = (text: string) => say(`${tone('!', 'warn')} ${text}`);
 	check(Number(process.versions.node.split('.')[0]) >= 22, `node ${process.versions.node}`, 'jarvis-code needs Node 22 or newer');
-	const fm = onPath(config.foreman.bin);
-	check(fm, `Foreman: ${fm ? version(config.foreman.bin) ?? config.foreman.bin : 'not found'}`, 'install https://github.com/ChaseSunstrom/foreman, or run with --tasks memory');
 	let any = false;
 	for (const [name, a] of Object.entries(config.agents)) {
 		const on = agentEnabled(a);

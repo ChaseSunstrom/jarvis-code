@@ -3,7 +3,7 @@
   "owner": {
     "name": "Chase Sunstrom"
   },
-  "description": "jarvis-code: run Claude Code as a worker of the jarvis-code orchestrator (Foreman-driven, multi-agent).",
+  "description": "jarvis-code: run Claude Code as a worker of the jarvis-code multi-agent orchestrator.",
   "plugins": [
     {
       "name": "jarvis-code",

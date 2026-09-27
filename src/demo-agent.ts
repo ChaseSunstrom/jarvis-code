@@ -4,16 +4,29 @@
  * text lines otherwise. As a planner it answers with a plan; as a worker it "works" for a
  * moment and satisfies the `test -f PATH` checks named in its prompt.
  *
+ * As a prompt writer it calls goals with open-ended words "open"; as a brainstormer it gives
+ * fewer new ideas each round (3, 2, 1, then none), like a real brainstorm running dry.
+ *
  * Env: JC_DEMO_PACE — ms per step (default 450) · JC_DEMO_PLAN — plan JSON to answer with ·
+ * JC_DEMO_REVIEW=changes-first — as a reviewer, ask for changes until the diff shows a
+ * `.reviewed` marker (which a worker writes when its prompt carries review findings) ·
+ * JC_DEMO_REPLAN — plan JSON to answer a re-plan with (default: cannot split) ·
+ * JC_DEMO_PLAN_FIXED — plan JSON to answer when asked to fix a plan's problems ·
+ * JC_DEMO_KIND=open|concrete — force the prompt writer's call · JC_DEMO_BREAK=prompt,ideas —
+ * answer those stages with prose instead of JSON · JC_DEMO_NOTES=1 — the first
+ * task reports a lesson and a follow-up · JC_DEMO_LOG — append every prompt to this file ·
  * JC_DEMO_DOWNGRADE=1|some — a model named *fable* is downgraded once per session (`some`:
  * every third task); like the real CLI, a switch back applies from the next turn. A model named *flaky* never satisfies its checks (a weak local model).
  */
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 const PLAN_MARKER = 'JARVIS-CODE PLAN';
+const PROMPT_MARKER = 'JARVIS-CODE PROMPT';
+const IDEAS_MARKER = 'JARVIS-CODE IDEAS';
+const REVIEW_MARKER = 'JARVIS-CODE REVIEW';
 const argv = process.argv.slice(2);
 const stream = argv.includes('--input-format');
 const argOf = (name: string) => {
@@ -55,7 +68,11 @@ async function say(text: string) {
 }
 
 let ids = 0;
+// `--tools ""`, as the real CLI takes it: no tools at all this session.
+const noTools = argOf('--tools') === '';
+
 async function tool(name: string, input: Record<string, unknown>, ok = true, result = 'ok') {
+	if (noTools) return;
 	const id = `toolu_${++ids}`;
 	if (stream) {
 		out({ type: 'assistant', parent_tool_use_id: null, message: { model, content: [{ type: 'tool_use', id, name, input }] } });
@@ -86,6 +103,39 @@ function writeChecks() {
 }
 
 async function work(prompt: string): Promise<{ ok: boolean; text: string }> {
+	if (process.env.JC_DEMO_LOG) appendFileSync(process.env.JC_DEMO_LOG, JSON.stringify(noTools ? `[no tools] ${prompt}` : prompt) + '\n');
+	const broken = (stage: string) => (process.env.JC_DEMO_BREAK ?? '').split(',').includes(stage);
+	if (prompt.includes(PROMPT_MARKER) && broken('prompt')) return { ok: true, text: 'I looked around; the goal seems fine.' };
+	if (prompt.includes(IDEAS_MARKER) && broken('ideas')) return { ok: true, text: 'Some thoughts: make it faster.' };
+	if (prompt.includes(REVIEW_MARKER)) {
+		await tool('Read', { file_path: 'src/config.ts' });
+		const addressed = /\.reviewed\b/.test(prompt);
+		if (process.env.JC_DEMO_REVIEW === 'changes-first' && !addressed)
+			return { ok: true, text: JSON.stringify({ verdict: 'changes', findings: ['src/config.ts:12: the loader ignores an empty settings file', 'src/config.ts:30: no test covers the reload path'] }) };
+		return { ok: true, text: JSON.stringify({ verdict: 'approve', findings: [] }) };
+	}
+	if (prompt.includes(PROMPT_MARKER)) {
+		await tool('Read', { file_path: 'README.md' });
+		const goal = prompt.match(/Goal, in the user's words: (.*)/)?.[1] ?? '';
+		const kind = process.env.JC_DEMO_KIND ?? (/\b(improve|better|modernize|polish|features|ideas)\b/i.test(goal) ? 'open' : 'concrete');
+		const brief = `Goal: ${goal}. The project builds with npm and tests with \`npm test\`; the change touches src/config.ts. Done when the tests pass.`;
+		return { ok: true, text: JSON.stringify({ brief, kind, lenses: ['developer experience'] }) };
+	}
+	if (prompt.includes(IDEAS_MARKER)) {
+		await tool('Read', { file_path: 'README.md' });
+		const lens = prompt.match(/Your angle: (.*?)\. Round/)?.[1] ?? 'lens';
+		const round = Number(prompt.match(/Round (\d+)\./)?.[1] ?? 1);
+		const seen = [...prompt.matchAll(/^- (.+)$/gm)].map((m) => m[1]);
+		// A repeat of an earlier idea, as real brainstormers give: it must be deduplicated.
+		const ideas = [...seen.slice(0, 1), ...Array.from({ length: Math.max(0, 4 - round) }, (_, k) => `${lens}: idea ${round}.${k + 1}`)].map((title) => ({ title, why: 'it helps', effort: 'S' }));
+		return { ok: true, text: JSON.stringify({ ideas }) };
+	}
+	if (prompt.includes(PLAN_MARKER) && /^RE-PLAN:/m.test(prompt)) {
+		await tool('Read', { file_path: 'README.md' });
+		return { ok: true, text: process.env.JC_DEMO_REPLAN ?? '{"tasks":[]}' };
+	}
+	if (prompt.includes(PLAN_MARKER) && /Your previous plan \(below\) has these problems/.test(prompt) && process.env.JC_DEMO_PLAN_FIXED)
+		return { ok: true, text: process.env.JC_DEMO_PLAN_FIXED };
 	if (prompt.includes(PLAN_MARKER)) {
 		await tool('Glob', { pattern: '**/*' });
 		await tool('Read', { file_path: 'README.md' });
@@ -100,6 +150,8 @@ async function work(prompt: string): Promise<{ ok: boolean; text: string }> {
 	}
 	task = prompt.match(/^Task (\S+)/)?.[1] ?? 'task';
 	files = [...prompt.matchAll(/test -f ([^\s`&;|]+)/g)].map((m) => m[1]);
+	// Review findings in hand: address them, and leave a marker the reviewer will see in the diff.
+	if (/asked for these before it can close/.test(prompt)) files.push(`.jarvis-demo/${task}.reviewed`);
 	await say(`Working on ${task}.`);
 	await tool('Grep', { pattern: 'loadConfig' });
 	await tool('Read', { file_path: 'src/config.ts' });
@@ -108,7 +160,8 @@ async function work(prompt: string): Promise<{ ok: boolean; text: string }> {
 	await tool('Bash', { command: 'npm test' });
 	if (/flaky/.test(model)) return { ok: true, text: 'I think it is done.' };
 	writeChecks();
-	return { ok: true, text: `${task}: made the change on ${model}; ${files.length} check(s) should pass.` };
+	const notes = process.env.JC_DEMO_NOTES && /T-0*1\b/.test(task) ? '\nLESSON: the settings tests need JC_ENV=test\nFOLLOW-UP: Fix the stale cache in the legacy loader' : '';
+	return { ok: true, text: `${task}: made the change on ${model}; ${files.length} check(s) should pass.${notes}` };
 }
 
 async function main() {

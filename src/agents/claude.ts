@@ -1,6 +1,6 @@
 import type { AgentConfig } from '../config.js';
 import { outcomeFromExit, run } from './spawn.js';
-import { summarize, type AgentRun, type Emit, type Outcome, type RunSpec } from './types.js';
+import { sameModel, summarize, type AgentRun, type Emit, type Outcome, type RunSpec } from './types.js';
 
 type Obj = Record<string, any>;
 
@@ -39,6 +39,7 @@ export class ClaudeParser {
 	accepted?: string;
 	readonly tools = new Map<string, string>();
 	readonly pending = new Map<string, string>();
+	readonly results: string[] = [];
 	constructor(private emit: Emit) {}
 
 	line(v: unknown): void {
@@ -52,7 +53,9 @@ export class ClaudeParser {
 			case 'user':
 				return this.toolResults(e);
 			case 'result':
+				this.results.push(typeof e.result === 'string' ? e.result : '');
 				this.final = {
+					results: this.results,
 					ok: e.subtype === 'success' && !e.is_error,
 					summary: typeof e.result === 'string' ? e.result : '',
 					costUsd: e.total_cost_usd,
@@ -85,7 +88,7 @@ export class ClaudeParser {
 				this.model = e.model;
 				this.emit({ type: 'init', model: e.model, session: e.session_id });
 				if (this.accepted) {
-					this.emit({ type: 'reupgrade', model: this.accepted, ok: e.model === this.accepted });
+					this.emit({ type: 'reupgrade', model: this.accepted, ok: sameModel(e.model, this.accepted) });
 					this.accepted = undefined;
 				}
 				return;
@@ -113,7 +116,9 @@ export class ClaudeParser {
 	private assistant(e: Obj): void {
 		const m = e.message ?? {};
 		const main = !e.parent_tool_use_id;
-		if (main && this.model && m.model && m.model !== this.model && m.model !== this.accepted && m.model !== '<synthetic>') {
+		// The backstop for a switch no event announced. Ids are compared without their `[1m]`-style
+		// suffix: the session is started as `x[1m]` while its messages report `x`.
+		if (main && this.model && m.model && !sameModel(m.model, this.model) && !sameModel(m.model, this.accepted) && m.model !== '<synthetic>') {
 			this.switched(this.model, m.model, 'switched', true);
 		}
 		for (const c of m.content ?? []) {
@@ -151,21 +156,24 @@ export function claudeArgs(cfg: AgentConfig, spec: RunSpec): string[] {
 	// `Agent(Explore)`-style keys are refused by the plugin's hook; plain names by the CLI.
 	const deny = spec.blockedTools.filter((t) => !t.includes('('));
 	if (spec.role === 'planner') deny.push(...EDIT_TOOLS);
-	if (deny.length) args.push(`--disallowedTools=${deny.join(',')}`);
+	if (spec.tools === 'none') args.push('--tools', '');
+	else if (deny.length) args.push(`--disallowedTools=${deny.join(',')}`);
 	if (spec.context) args.push('--append-system-prompt', spec.context);
 	return [...args, ...cfg.args];
 }
 
 /** The turn that hands a downgraded task back to the model it was meant for. */
-export const followUp = (model: string) =>
+export const followUp = (model: string, role: RunSpec['role']) =>
 	`An automatic fallback moved part of this task to another model; you are back on ${model}. ` +
-	'Review what was done for the task in this session, fix or finish anything missing, run its checks, and reply with the final summary.';
+	(role === 'planner'
+		? 'Review the plan you gave, fix anything wrong with it, and reply again with ONLY the final JSON plan.'
+		: 'Review what was done for the task in this session, fix or finish anything missing, run its checks, and reply with the final summary.');
 
 export function start(cfg: AgentConfig, spec: RunSpec, emit: Emit): AgentRun {
 	const parser = new ClaudeParser(emit);
 	let ids = 0;
 	let followed = false;
-	const p = run(cfg.bin, claudeArgs(cfg, spec), { cwd: spec.cwd, env: { ...cfg.env, ...spec.env }, timeoutMin: cfg.timeoutMin, stdin: true }, (v) => {
+	const p = run(cfg.bin, claudeArgs(cfg, spec), { cwd: spec.cwd, env: { ...cfg.env, ...spec.env }, timeoutMin: cfg.timeoutMin, idleMin: cfg.idleMin, stdin: true }, (v) => {
 		const accepted = parser.accepted;
 		parser.line(v);
 		if ((v as Obj)?.type !== 'result') return;
@@ -173,7 +181,7 @@ export function start(cfg: AgentConfig, spec: RunSpec, emit: Emit): AgentRun {
 		// turn on the restored model; otherwise stream-json input would wait for more input.
 		if (accepted && !followed) {
 			followed = true;
-			send({ type: 'user', message: { role: 'user', content: followUp(accepted) } });
+			send({ type: 'user', message: { role: 'user', content: followUp(accepted, spec.role) } });
 		} else p.child.stdin?.end();
 	});
 	const send = (o: object) => {

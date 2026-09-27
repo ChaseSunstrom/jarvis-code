@@ -16,6 +16,8 @@ export interface RunSpec {
 	cwd: string;
 	model?: string;
 	role: 'planner' | 'worker';
+	/** `none`: answer from the prompt alone, no tools at all (where the CLI can do that). */
+	tools?: 'none';
 	/** Appended to the agent's system prompt (or prepended to the prompt where there is none). */
 	context?: string;
 	/** Learned-bad tools: `Name` or `Name(subagent)`. */
@@ -34,7 +36,12 @@ export interface Outcome {
 	exitCode: number | null;
 	/** Model the session ended on, when the agent reports it. */
 	model?: string;
+	/** Every turn's final message, oldest first (a session can run more than one turn). */
+	results?: string[];
 }
+
+/** `claude-opus-5-5[1m]` and `claude-opus-5-5` are one model: the suffix picks a context size. */
+export const sameModel = (a?: string, b?: string) => !!a && !!b && a.replace(/\[[^\]]*\]$/, '') === b.replace(/\[[^\]]*\]$/, '');
 
 export interface AgentRun {
 	done: Promise<Outcome>;
@@ -51,4 +58,13 @@ export function summarize(name: string, input: unknown): string {
 	const pick = i.command ?? i.file_path ?? i.filePath ?? i.path ?? i.pattern ?? i.url ?? i.query ?? i.description ?? i.prompt;
 	const s = typeof pick === 'string' ? pick : '';
 	return (s ? `${name} ${s}` : name).replace(/\s+/g, ' ').slice(0, 160);
+}
+
+/**
+ * Agent and check output is shown in the operator's terminal and kept in the task store, and
+ * a repository can steer what an agent prints: no control characters (an escape sequence could
+ * clear or fake the screen), tabs as spaces, newlines kept.
+ */
+export function clean(s: string): string {
+	return s.replace(/\t/g, '  ').replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, '');
 }

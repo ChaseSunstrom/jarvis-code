@@ -3,10 +3,10 @@ import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { DEFAULTS, type AgentConfig } from '../src/config.js';
 import { startAgent, type AgentEvent, type RunSpec } from '../src/agents/index.js';
-import { ClaudeParser } from '../src/agents/claude.js';
+import { ClaudeParser, claudeArgs } from '../src/agents/claude.js';
 import { codexArgs } from '../src/agents/codex.js';
 
 const fixtures = fileURLToPath(new URL('../../test/fixtures/', import.meta.url));
@@ -101,6 +101,9 @@ test('generic: {prompt} is substituted and stdout is the summary', async () => {
 	const out = await startAgent(cfg, spec({ prompt: 'hello' }), (e) => events.push(e)).done;
 	assert.equal(out.ok, true);
 	assert.equal(out.summary, 'got: hello');
+	const multi = await startAgent(agent({ kind: 'generic', bin: process.execPath, args: ['-e', 'console.log("```json\\n{\\"tasks\\":[]}\\n```")'] }), spec(), () => {}).done;
+	assert.equal(multi.summary, '```', 'the summary is the last line');
+	assert.equal(multi.results?.[0], '```json\n{"tasks":[]}\n```\n', 'the result is the whole answer, so a plan spanning lines parses');
 	const missing = await startAgent(agent({ kind: 'generic', bin: '/nonexistent/agent' }), spec(), () => {}).done;
 	assert.equal(missing.ok, false);
 	assert.match(missing.error ?? '', /ENOENT/);
@@ -113,4 +116,66 @@ test('codex: workers get a writable sandbox unless the config picked one', () =>
 	const own = codexArgs({ ...cfg, args: ['--full-auto'] }, spec());
 	assert.equal(own.filter((a) => a === '--sandbox').length, 0);
 	assert.equal(own.at(-1), 'do the thing');
+});
+
+test('claude: a [1m]-style suffix is the same model, not a switch', () => {
+	const events: AgentEvent[] = [];
+	const p = new ClaudeParser((e) => events.push(e));
+	p.line({ type: 'system', subtype: 'init', model: 'claude-opus-5-5[1m]', session_id: 's' });
+	p.line({ type: 'assistant', parent_tool_use_id: null, message: { model: 'claude-opus-5-5', content: [{ type: 'text', text: 'hi' }] } });
+	assert.equal(events.filter((e) => e.type === 'model').length, 0);
+	p.line({ type: 'assistant', parent_tool_use_id: null, message: { model: 'claude-sonnet-5', content: [{ type: 'text', text: 'hi' }] } });
+	assert.equal(events.filter((e) => e.type === 'model').length, 1, 'a different model still counts');
+});
+
+test('claude: every turn result is kept', async () => {
+	const cfg = agent({ bin: join(fixtures, 'fake-claude.mjs'), env: { FAKE_TEXT1: 'first turn' } });
+	const run = startAgent(cfg, spec({ model: 'claude-fable-5-1' }), (e) => {
+		if (e.type === 'model' && e.sticky && e.from) run.setModel!(e.from);
+	});
+	const out = await run.done;
+	assert.deepEqual(out.results, ['first turn', 'reviewed on claude-fable-5-1']);
+});
+
+test('idle watchdog: a worker that goes silent is killed with a reason', async () => {
+	const cfg = agent({ kind: 'generic', bin: process.execPath, args: ['-e', 'console.log("started"); setTimeout(() => {}, 60000)'], idleMin: 0.01 });
+	const t0 = Date.now();
+	const out = await startAgent(cfg, spec(), () => {}).done;
+	assert.equal(out.ok, false);
+	assert.match(out.error ?? '', /no output for/);
+	assert.ok(Date.now() - t0 < 10_000, 'killed long before its whole-run timeout');
+});
+
+test('agent children are killed when jarvis-code crashes', async () => {
+	const { spawnSync } = await import('node:child_process');
+	const spawnJs = fileURLToPath(new URL('../src/agents/spawn.js', import.meta.url));
+	const r = spawnSync(process.execPath, [join(fixtures, 'orphan-parent.mjs'), pathToFileURL(spawnJs).href], { encoding: 'utf8', timeout: 20_000 });
+	const pid = Number(r.stdout.trim().split('\n')[0]);
+	assert.ok(pid > 0, `no child pid: ${r.stdout} ${r.stderr}`);
+	await new Promise((res) => setTimeout(res, 300));
+	let alive = true;
+	try {
+		process.kill(pid, 0);
+	} catch {
+		alive = false;
+	}
+	if (alive) process.kill(pid, 'SIGKILL');
+	assert.equal(alive, false, 'the agent outlived its parent');
+});
+
+test('agent output reaches the terminal without control characters', async () => {
+	// A repository can steer what an agent prints: an escape sequence must not reach the screen.
+	const cfg = agent({ kind: 'generic', bin: process.execPath, args: ['-e', 'console.log("FOLLOW-UP: \\x1b[2J\\x1b[Hfake\\x07\\ttab\\x9b31m")'] });
+	const events: AgentEvent[] = [];
+	const out = await startAgent(cfg, spec(), (e) => events.push(e)).done;
+	const text = events.find((e) => e.type === 'text');
+	assert.equal(text?.type === 'text' && text.text, 'FOLLOW-UP: [2J[Hfake  tab31m');
+	assert.equal(out.summary, 'FOLLOW-UP: [2J[Hfake  tab31m');
+	assert.ok(!/[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(out.results?.[0] ?? ''));
+});
+
+test('claude: a tool-less session starts with --tools "" and no deny list', () => {
+	const args = claudeArgs(agent({}), spec({ role: 'planner', tools: 'none', blockedTools: ['WebFetch'] }));
+	assert.deepEqual(args.slice(args.indexOf('--tools'), args.indexOf('--tools') + 2), ['--tools', '']);
+	assert.ok(!args.some((a) => a.startsWith('--disallowedTools')));
 });

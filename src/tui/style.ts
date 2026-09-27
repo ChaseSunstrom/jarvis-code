@@ -12,11 +12,11 @@ export const KIND: Record<ActivityKind, [icon: string, tone: Tone]> = {
 
 export const STATUS: Record<TaskStatus, [icon: string, tone: Tone]> = {
 	queued: ['·', 'textFaint'], running: ['◠', 'accent'], verifying: ['◎', 'accentLift'], done: ['✓', 'ok'],
-	failed: ['✗', 'danger'], blocked: ['⊘', 'warn'], review: ['◇', 'warn'],
+	failed: ['✗', 'danger'], blocked: ['⊘', 'warn'], review: ['◇', 'warn'], split: ['↳', 'textDim'],
 };
 
 /** Queue order on screen: what is moving, then what needs a human, then what waits, then history. */
-export const ORDER: TaskStatus[] = ['running', 'verifying', 'blocked', 'review', 'failed', 'queued', 'done'];
+export const ORDER: TaskStatus[] = ['running', 'verifying', 'blocked', 'review', 'failed', 'queued', 'done', 'split'];
 
 /** The HUD's label style: uppercase, tracked. */
 export const cap = (s: string) => s.toUpperCase().split('').join(' ');

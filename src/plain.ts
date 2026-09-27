@@ -18,7 +18,8 @@ export function attachPlain(o: Orchestrator, ui: Config['ui'], out: NodeJS.Write
 		const s = o.snapshot();
 		const n = (st: string) => s.tasks.filter((t) => t.status === st).length;
 		out.write(
-			`\n${paint('jarvis-code', palette.accent, 1, depth)}: ${n('done')}/${s.tasks.length} done, ${n('blocked')} blocked, ${n('review')} to review · $${s.cost.toFixed(2)} · ${elapsed(Date.now() - s.started)}\n`,
+			`\n${paint('jarvis-code', palette.accent, 1, depth)}: ${n('done')}/${s.tasks.length - n('split')} done, ${n('blocked')} blocked, ${n('review')} to review · $${s.cost.toFixed(2)} · ${elapsed(Date.now() - s.started)}\n`,
 		);
+		if (o.reportPath) out.write(`${paint('report', palette.textDim, 1, depth)} ${o.reportPath}\n`);
 	};
 }

@@ -23,6 +23,8 @@ export interface Stat {
 export interface LearningData {
 	routes: Record<string, Stat>;
 	tools: Record<string, Stat>;
+	/** Worker outcomes per `route@TYPE`: a route can be good at one kind of task and bad at another. */
+	kinds: Record<string, Stat>;
 }
 
 export interface Route {
@@ -46,10 +48,10 @@ export class Learning {
 		private file = join(paths.stateDir(), 'learning.json'),
 		private now = () => Date.now(),
 	) {
-		this.data = { routes: {}, tools: {} };
+		this.data = { routes: {}, tools: {}, kinds: {} };
 		try {
 			const raw = JSON.parse(readFileSync(file, 'utf8'));
-			this.data = { routes: raw.routes ?? {}, tools: raw.tools ?? {} };
+			this.data = { routes: raw.routes ?? {}, tools: raw.tools ?? {}, kinds: raw.kinds ?? {} };
 		} catch {
 			/* first run, or an unreadable file: start fresh rather than refuse to run */
 		}
@@ -94,6 +96,20 @@ export class Learning {
 		return this.record(this.data.routes, route, ok);
 	}
 
+	/** A worker outcome for one task type; returns a reason when the route is now off for that type. */
+	recordKind(route: string, type: string, ok: boolean) {
+		return this.record(this.data.kinds, `${route}@${type.toUpperCase()}`, ok);
+	}
+
+	kind(route: string, type?: string): Stat | undefined {
+		return type ? this.data.kinds[`${route}@${type.toUpperCase()}`] : undefined;
+	}
+
+	/** The route is off, or off for this task type. */
+	offFor(route: string, type?: string): boolean {
+		return this.routeOff(route) || this.isOff(this.kind(route, type));
+	}
+
 	/** Tool outcomes count only for tools a run can do without (subagents, MCP, web...). */
 	recordTool(agent: string, tool: string, ok: boolean) {
 		if (!learnable(tool, this.cfg.neverBlock)) return;
@@ -118,11 +134,29 @@ export class Learning {
 
 	/** Clear what was learned about a route or tool key (or everything). */
 	reset(key?: string): void {
-		if (!key) this.data = { routes: {}, tools: {} };
-		else {
-			delete this.data.routes[key];
-			delete this.data.tools[key];
+		if (!key) this.data = { routes: {}, tools: {}, kinds: {} };
+		else this.forgive(key);
+	}
+
+	/**
+	 * Forget what was learned about a route (`claude:model`), a tool under one agent
+	 * (`claude › Agent(Explore)` or `claude|Agent(Explore)`), or a tool under every agent
+	 * (`Agent(Explore)`). Returns the keys forgotten.
+	 */
+	forgive(query: string): string[] {
+		const q = query.trim().replace(/\s*›\s*/, '|');
+		const gone = [
+			...Object.keys(this.data.routes).filter((k) => k === q),
+			...Object.keys(this.data.tools).filter((k) => k === q || k.endsWith(`|${q}`)),
+			// A route's per-type records go with it; `route@TYPE` forgives just that type.
+			...Object.keys(this.data.kinds).filter((k) => k === q || k.startsWith(`${q}@`)),
+		];
+		for (const k of gone) {
+			delete this.data.routes[k];
+			delete this.data.tools[k];
+			delete this.data.kinds[k];
 		}
+		return gone;
 	}
 }
 
@@ -147,18 +181,66 @@ export function routesFor(config: Config, role: 'planner' | 'worker', enabled = 
 	return all.filter((r) => config.agents[r.agent] && enabled(config.agents[r.agent]));
 }
 
+/** What a route is being chosen for: its task's type and tier, when it is a task. */
+export interface For {
+	type?: string;
+	tier?: string;
+}
+
 /**
- * The route to use next. Skips `exclude` (routes this task already failed on) and
- * switched-off routes; when every route is off, the one whose cooldown ends first is
- * probed early rather than stalling the queue.
+ * The route to use next, and why. Skips `exclude` (routes this task already failed on) and
+ * routes switched off (overall, or for this task's type); when every route is off, the one
+ * whose cooldown ends first is probed early rather than stalling the queue.
+ *
+ * - `priority`: the first healthy route in your order.
+ * - `best`: the highest learned score, for this task type once it has a record, else overall.
+ * - `escalate`: your order read as cheapest → strongest. S tasks start cheap, M in the
+ *   middle, L and SECURITY at the strongest; each failure moves to the next.
  */
-export function pick(routes: Route[], learning: Learning, strategy: Config['strategy'], exclude: Set<string> = new Set()): Route | undefined {
+export function choose(routes: Route[], learning: Learning, strategy: Config['strategy'], exclude: Set<string> = new Set(), task: For = {}): { route: Route; why: string } | undefined {
 	const open = routes.filter((r) => !exclude.has(r.id));
-	const healthy = open.filter((r) => !learning.routeOff(r.id));
-	if (healthy.length) {
-		if (strategy === 'priority') return healthy[0];
-		return healthy.reduce((best, r) => (score(learning.data.routes[r.id]) > score(learning.data.routes[best.id]) ? r : best));
+	const type = task.type?.toUpperCase();
+	let order = open;
+	let start = 'cheapest';
+	if (strategy === 'escalate') {
+		if (/^L$/i.test(task.tier ?? '') || type === 'SECURITY') [order, start] = [[...open].reverse(), 'strongest'];
+		else if (/^M$/i.test(task.tier ?? '')) {
+			const mid = Math.floor(open.length / 2);
+			[order, start] = [[...open.slice(mid), ...open.slice(0, mid).reverse()], 'mid-range'];
+		}
 	}
-	const until = (r: Route) => Date.parse(learning.data.routes[r.id]?.disabledUntil ?? '0');
-	return open.sort((a, b) => until(a) - until(b))[0];
+	const healthy = order.filter((r) => !learning.offFor(r.id, type));
+	if (healthy.length) {
+		const retry = exclude.size ? ', after a failed attempt' : '';
+		if (strategy === 'best') {
+			const typed = (r: Route) => {
+				const k = learning.kind(r.id, type);
+				return k && k.runs >= 3 ? k : undefined;
+			};
+			const rate = (r: Route) => score(typed(r) ?? learning.data.routes[r.id]);
+			const best = healthy.reduce((a, r) => (rate(r) > rate(a) ? r : a));
+			const st = typed(best) ?? learning.data.routes[best.id];
+			return { route: best, why: st ? `best ${typed(best) ? `for ${type}` : 'overall'}: ${Math.round(score(st) * 100)}% of ${st.runs}${retry}` : `no record yet${retry}` };
+		}
+		if (strategy === 'escalate') return { route: healthy[0], why: exclude.size ? 'escalating after a failed attempt' : `${task.tier ?? 'S'}${type === 'SECURITY' ? ' SECURITY' : ''} task: starts ${start}` };
+		return { route: healthy[0], why: `first healthy in your order${retry}` };
+	}
+	const until = (r: Route) => Math.max(Date.parse(learning.data.routes[r.id]?.disabledUntil ?? '0'), Date.parse(learning.kind(r.id, type)?.disabledUntil ?? '0'));
+	const route = open.sort((a, b) => until(a) - until(b))[0];
+	return route && { route, why: 'every route is off: probing the one whose cooldown ends first' };
+}
+
+export function pick(routes: Route[], learning: Learning, strategy: Config['strategy'], exclude: Set<string> = new Set(), task: For = {}): Route | undefined {
+	return choose(routes, learning, strategy, exclude, task)?.route;
+}
+
+/** A route's per-type record, most runs first, at most 4: 'FIX 3/4, FEATURE 5/6'. '' when there is none. */
+export function kindSummary(learning: Learning, route: string): string {
+	const prefix = `${route}@`;
+	return Object.entries(learning.data.kinds)
+		.filter(([k]) => k.startsWith(prefix))
+		.sort(([, a], [, b]) => b.runs - a.runs)
+		.slice(0, 4)
+		.map(([k, st]) => `${k.slice(prefix.length)} ${st.ok}/${st.runs}`)
+		.join(', ');
 }

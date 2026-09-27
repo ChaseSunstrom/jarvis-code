@@ -1,7 +1,7 @@
 {
   "name": "jarvis-code",
   "version": "0.1.0",
-  "description": "A Foreman-driven orchestrator for Claude Code, Codex, OpenCode and other coding agents, with a Jarvis arc-reactor TUI.",
+  "description": "An orchestrator for Claude Code, Codex, OpenCode and other coding agents: plans goals into verified tasks, learns what works, with a Jarvis arc-reactor TUI.",
   "license": "MIT",
   "type": "module",
   "bin": {
@@ -24,7 +24,8 @@
     "prepare": "tsc -p .",
     "test": "tsc -p . && node --test --test-concurrency=1 dist/test/",
     "verify:reactor": "node scripts/verify-reactor.mjs",
-    "start": "node dist/src/cli.js"
+    "start": "node dist/src/cli.js",
+    "verify:cockpit": "node scripts/verify-cockpit.mjs"
   },
   "repository": {
     "type": "git",
@@ -45,7 +46,6 @@
     "claude-code",
     "codex",
     "opencode",
-    "foreman",
     "orchestrator",
     "tui",
     "ink",

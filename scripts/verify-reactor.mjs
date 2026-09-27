@@ -23,9 +23,23 @@ const child = spawn('script', ['-qfec', `stty cols ${COLS} rows ${ROWS}; exec no
 child.stdout.on('data', (d) => term.write(d));
 
 const lines = () => Array.from({ length: ROWS }, (_, y) => term.buffer.active.getLine(y)?.translateToString(true) ?? '');
-/** The braille block (the reactor) in the header: every braille cell, in reading order. */
-const reactor = (ls) => ls.slice(0, 20).map((l) => l.replace(/[^⠀-⣿]/g, ' ').trimEnd()).join('\n');
-const braille = (s) => (s.match(/[⠀-⣿]/g) ?? []).length;
+const REACTOR_CHARS = /[\u2800-\u28ff▀▄█]/;
+/**
+ * The reactor in the header, as every braille/half-block cell with its colours: the
+ * instrument keeps its shapes and moves light, so motion shows in the colours.
+ */
+function reactorCells() {
+	const cells = [];
+	const cell = term.buffer.active.getNullCell();
+	for (let y = 0; y < 20; y++) {
+		const line = term.buffer.active.getLine(y);
+		for (let x = 0; x < 50; x++) {
+			line.getCell(x, cell);
+			if (REACTOR_CHARS.test(cell.getChars())) cells.push(`${cell.getChars()}${cell.getFgColor()}/${cell.getBgColor()}`);
+		}
+	}
+	return cells;
+}
 const state = (ls) => ls.slice(0, 20).join(' ').match(/\b(PLANNING|WORKING|ALERT|FINISHED[^ ]*)\b/)?.[1] ?? '?';
 
 /** Braille cells painted in 24-bit colour: the reactor's truecolor path was taken. */
@@ -36,7 +50,7 @@ function rgbReactorCells() {
 		const line = term.buffer.active.getLine(y);
 		for (let x = 0; x < COLS; x++) {
 			line.getCell(x, cell);
-			if (/[\u2800-\u28ff]/.test(cell.getChars()) && cell.isFgRGB()) n++;
+			if (REACTOR_CHARS.test(cell.getChars()) && cell.isFgRGB()) n++;
 		}
 	}
 	return n;
@@ -52,10 +66,11 @@ function ansiScreen() {
 		for (let x = 0; x < COLS; x++) {
 			line.getCell(x, cell);
 			const ch = cell.getChars() || ' ';
-			if (cell.isFgRGB()) {
-				const c = cell.getFgColor();
-				s += `\x1b[38;2;${(c >> 16) & 255};${(c >> 8) & 255};${c & 255}m${ch}`;
-			} else s += `\x1b[0m${ch}`;
+			const rgbOf = (c) => `${(c >> 16) & 255};${(c >> 8) & 255};${c & 255}`;
+			s += '\x1b[0m';
+			if (cell.isFgRGB()) s += `\x1b[38;2;${rgbOf(cell.getFgColor())}m`;
+			if (cell.isBgRGB()) s += `\x1b[48;2;${rgbOf(cell.getBgColor())}m`;
+			s += ch;
 		}
 		out.push(s + '\x1b[0m');
 	}
@@ -69,7 +84,8 @@ let dumped = false;
 const started = Date.now();
 const timer = setInterval(() => {
 	const ls = lines();
-	const s = { t: Date.now() - started, state: state(ls), reactor: reactor(ls) };
+	const r = reactorCells();
+	const s = { t: Date.now() - started, state: state(ls), reactor: r.join(' '), cells: r.length };
 	samples.push(s);
 	if (s.state === 'WORKING') rgbCells = Math.max(rgbCells, rgbReactorCells());
 	if (dumpFile && !dumped && s.state === 'WORKING' && s.t > 6000) {
@@ -79,7 +95,9 @@ const timer = setInterval(() => {
 	if (!finishedAt && s.state.startsWith('FINISHED')) finishedAt = Date.now();
 	if (finishedAt && Date.now() - finishedAt > 2500) {
 		clearInterval(timer);
-		child.stdin.write('q');
+		// The cockpit: Ctrl+C leaves the run for home, a second one quits (no runs are going).
+		child.stdin.write('\x03');
+		setTimeout(() => child.stdin.write('\x03'), 400);
 	}
 	if (Date.now() - started > 120_000) {
 		clearInterval(timer);
@@ -100,7 +118,7 @@ child.on('exit', (code) => {
 	const distinct = new Set(working.map((s) => s.reactor)).size;
 	let changes = 0;
 	for (let i = 1; i < working.length; i++) if (working[i].reactor !== working[i - 1].reactor) changes++;
-	const cells = Math.max(0, ...samples.map((s) => braille(s.reactor)));
+	const cells = Math.max(0, ...samples.map((s) => s.cells));
 	const report = {
 		exit: code,
 		samples: samples.length,
@@ -114,7 +132,7 @@ child.on('exit', (code) => {
 	console.log(JSON.stringify(report, null, 2));
 	if (code !== 0) fail(`demo exited ${code}`);
 	if (working.length < 20) fail(`only ${working.length} samples while running`);
-	if (cells < 150) fail(`the large reactor was not drawn (${cells} braille cells)`);
+	if (cells < 150) fail(`the large reactor was not drawn (${cells} cells)`);
 	if (changes < (working.length - 1) * 0.8) fail(`the reactor changed in only ${changes}/${working.length - 1} consecutive samples while running`);
 	if (done.length < 10 || !report.stillWhenFinished) fail('the reactor kept moving after the run finished');
 	if (rgbCells < 100) fail(`the reactor was not painted in truecolor (${rgbCells} cells)`);

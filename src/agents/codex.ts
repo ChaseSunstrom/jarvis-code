@@ -85,6 +85,6 @@ export function codexArgs(cfg: AgentConfig, spec: RunSpec): string[] {
 
 export function start(cfg: AgentConfig, spec: RunSpec, emit: Emit): AgentRun {
 	const parser = new CodexParser(emit);
-	const p = run(cfg.bin, codexArgs(cfg, spec), { cwd: spec.cwd, env: { ...cfg.env, ...spec.env }, timeoutMin: cfg.timeoutMin }, (v) => parser.line(v));
+	const p = run(cfg.bin, codexArgs(cfg, spec), { cwd: spec.cwd, env: { ...cfg.env, ...spec.env }, timeoutMin: cfg.timeoutMin, idleMin: cfg.idleMin }, (v) => parser.line(v));
 	return { done: p.exited.then((x) => outcomeFromExit(x, parser.final, emit)), kill: p.kill };
 }

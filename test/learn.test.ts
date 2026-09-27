@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { DEFAULTS, merge, type Config } from '../src/config.js';
 import { decide } from '../src/downgrade.js';
-import { Learning, learnable, pick, routesFor } from '../src/learn.js';
+import { choose, kindSummary, Learning, learnable, pick, routesFor } from '../src/learn.js';
 
 function fresh(now = { t: Date.parse('2026-09-27T00:00:00Z') }) {
 	const file = join(mkdtempSync(join(tmpdir(), 'jc-learn-')), 'learning.json');
@@ -95,4 +95,45 @@ test('downgrade policy: sticky refusal re-upgrades to the configured model, up t
 	assert.deepEqual(decide(DEFAULTS.downgrade, { ...ev, from: 'claude-opus-5-5' }, 0).model, 'claude-opus-5-5');
 	const retry = config({ downgrade: { default: { action: 'retry', max: 1 } } }).downgrade;
 	assert.equal(decide(retry, ev, 0).action, 'retry');
+});
+
+test('task type: a route off for one type still takes others; best ranks by the type\'s own record', () => {
+	const l = new Learning({ ...DEFAULTS.learning, minSamples: 3, disableBelow: 0.35 }, join(mkdtempSync(join(tmpdir(), 'jc-kind-')), 'l.json'));
+	const r = (id: string) => ({ id, agent: id.split(':')[0], model: id.split(':')[1] });
+	const routes = [r('local:cheap'), r('claude:strong')];
+	for (let i = 0; i < 4; i++) l.recordKind('local:cheap', 'SECURITY', false);
+	assert.equal(choose(routes, l, 'priority', new Set(), { type: 'SECURITY' })?.route.id, 'claude:strong', 'off for SECURITY');
+	assert.equal(choose(routes, l, 'priority', new Set(), { type: 'CLEAN' })?.route.id, 'local:cheap', 'still fine for CLEAN');
+	for (let i = 0; i < 4; i++) {
+		l.recordKind('local:cheap', 'FIX', true);
+		l.recordKind('claude:strong', 'FIX', false);
+		l.recordRoute('claude:strong', true);
+	}
+	const best = choose(routes, l, 'best', new Set(), { type: 'FIX' });
+	assert.equal(best?.route.id, 'local:cheap');
+	assert.match(best?.why ?? '', /^best for FIX: \d+% of 4$/);
+	assert.deepEqual(l.forgive('local:cheap@SECURITY'), ['local:cheap@SECURITY']);
+	assert.equal(choose(routes, l, 'priority', new Set(), { type: 'SECURITY' })?.route.id, 'local:cheap');
+});
+
+test('task type: escalate starts small tasks cheap, big and security tasks strong, and climbs on failure', () => {
+	const l = new Learning(DEFAULTS.learning, join(mkdtempSync(join(tmpdir(), 'jc-esc-')), 'l.json'));
+	const r = (id: string) => ({ id, agent: id.split(':')[0], model: id.split(':')[1] });
+	const routes = [r('local:cheap'), r('codex:mid'), r('claude:strong')];
+	const first = (task: { tier: string; type: string }, failed: string[] = []) => choose(routes, l, 'escalate', new Set(failed), task);
+	assert.deepEqual([first({ tier: 'S', type: 'FIX' })?.route.id, first({ tier: 'S', type: 'FIX' })?.why], ['local:cheap', 'S task: starts cheapest']);
+	assert.equal(first({ tier: 'M', type: 'FEATURE' })?.route.id, 'codex:mid');
+	assert.deepEqual([first({ tier: 'L', type: 'FEATURE' })?.route.id, first({ tier: 'S', type: 'SECURITY' })?.route.id], ['claude:strong', 'claude:strong']);
+	assert.deepEqual([first({ tier: 'S', type: 'FIX' }, ['local:cheap'])?.route.id, first({ tier: 'S', type: 'FIX' }, ['local:cheap'])?.why], ['codex:mid', 'escalating after a failed attempt']);
+});
+
+test('task type: kindSummary lists each type record of a route', () => {
+	const { l } = fresh();
+	assert.equal(kindSummary(l, 'claude'), '', 'no record yet');
+	for (const ok of [true, true, true, false]) l.recordKind('claude', 'FIX', ok);
+	for (const ok of [true, true, true, true, true, false]) l.recordKind('claude', 'FEATURE', ok);
+	for (const ok of [true, false]) l.recordKind('claude', 'CLEAN', ok);
+	l.recordKind('claude', 'PERF', true);
+	l.recordKind('claude', 'SECURITY', false);
+	assert.equal(kindSummary(l, 'claude'), 'FEATURE 5/6, FIX 3/4, CLEAN 1/2, PERF 1/1', 'most runs first, at most 4');
 });

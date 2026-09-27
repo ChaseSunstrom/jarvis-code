@@ -1,5 +1,6 @@
-import { exec, execFile } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { exec } from 'node:child_process';
+import { clean } from './agents/types.js';
+import type { Attempt, Project } from './store.js';
 
 export interface AC {
 	text: string;
@@ -13,10 +14,16 @@ export interface Task {
 	tier: string;
 	acs: AC[];
 	steps: string[];
-	/** The brief's execution prompt / notes, when it has one. */
+	/** What a worker needs beyond the title (approach, files, pitfalls). */
 	brief?: string;
+	/** What a person said when they sent this task back: guidance for the next worker. */
+	hint?: string;
 	/** Task ids this one waits for. */
 	depends?: string[];
+	/** `replan`: split from a blocked task, and never split again. */
+	source?: string;
+	/** Paths the plan said the task will change or create. */
+	files?: string[];
 }
 
 /** A task as the planner proposes it; `key`/`depends` link tasks within one plan. */
@@ -29,12 +36,16 @@ export interface PlannedTask {
 	steps?: string[];
 	depends?: string[];
 	notes?: string;
+	/** Paths (from the repository root) the task will change or create, tests included. */
+	files?: string[];
 }
 
 export interface Check {
 	cmd: string;
 	ok: boolean;
 	output: string;
+	/** The process exit code: 0 on success, `err.code` when the shell gave a numeric one. */
+	code?: number;
 }
 
 /** Where tasks come from and where their outcome is recorded. */
@@ -42,163 +53,171 @@ export interface TaskSource {
 	readonly name: string;
 	/** Open tasks in the order to work them, minus the ones this run already handled. */
 	next(skip: ReadonlySet<string>): Promise<Task[]>;
-	add(plan: PlannedTask[]): Promise<string[]>;
+	add(plan: PlannedTask[], goal?: string): Promise<string[]>;
 	start(task: Task): Promise<void>;
-	/** Run the task's verify commands. */
-	check(task: Task): Promise<Check[]>;
+	/** Run the task's verify commands, in `cwd` when given (an attempt's own worktree). */
+	check(task: Task, cwd?: string): Promise<Check[]>;
+	/** It passed, but a person has to look first (its changes did not merge). */
+	hold?(task: Task, reason: string): Promise<void>;
 	/** Record success; `closed: false` means it passed but the source wants a human (e.g. audits). */
 	close(task: Task, checks: Check[], note: string): Promise<{ closed: boolean; message: string }>;
 	block(task: Task, reason: string): Promise<void>;
+	/** Record one attempt (route, outcome, cost) where the source keeps history. */
+	attempt?(task: Task, a: Attempt): void;
+	/** Keep a planning artifact (prompt, brainstorm) where the source keeps history. */
+	research?(name: string, content: string): string | undefined;
+	/** Keep a worker's lessons and out-of-scope findings; returns the ids given to the findings. */
+	notes?(task: Task, lessons: string[], followUps: string[]): string[];
+	/** Recent lessons to give the next worker. */
+	lessons?(limit?: number): string[];
+	/** How often each tier passed on its first attempt here, for the planner. */
+	sizing?(): string | undefined;
+	/** A task the run stopped working: back in the queue as it was. */
+	requeue?(task: Task): Promise<void>;
+	/** The run's latest activity, so status can show it is still moving. */
+	beat?(a: { at: number; kind: string; text: string; task?: string }): void;
+	/** Replace a blocked task with smaller ones: add them, drop it, and move its dependents onto them. */
+	split?(task: Task, plan: PlannedTask[], why: string): Promise<string[]>;
 }
 
 const tail = (s: string, n = 400) => (s.length > n ? '…' + s.slice(-n) : s).trim();
 
+/** node --test-name-pattern, jest -t/--testNamePattern, go test -run */
+const FILTER_FLAG = /--test-name-pattern\b|--testNamePattern\b|(?:^|\s)-t(?:[=\s]|$)|(?:^|\s)-run(?:[=\s]|$)/;
+
+/** A filter flag matched zero tests: the check passed by finding nothing to run. */
+const filteredNoMatch = (cmd: string, full: string): boolean =>
+	FILTER_FLAG.test(cmd) &&
+	(/[#ℹ]\s*pass 0\b/.test(full) || (/\bTests:/.test(full) && !/\bpassed\b/.test(full)) || /no tests to run/.test(full));
+
 /**
  * Run a verify command through the shell in `cwd`. A shell on purpose: verify commands are
- * shell lines (`test -f x && npm test`), the same ones Foreman runs, written by the plan —
+ * shell lines (`test -f x && npm test`), written by the plan —
  * and the workers that satisfy them already run arbitrary commands in this repo.
  */
 export function shell(cmd: string, cwd: string, timeoutSec: number): Promise<Check> {
 	return new Promise((resolve) => {
-		exec(cmd, { cwd, timeout: timeoutSec * 1000, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
-			resolve({ cmd, ok: !err, output: tail(`${stdout}${stderr}`) || (err ? err.message : '') });
+		// Strip our own test runner's env: a verify command that runs `node --test` must not
+		// inherit jarvis-code's own NODE_TEST_CONTEXT, or node reports to us instead of it.
+		const { NODE_TEST_CONTEXT, NODE_TEST_WORKER_ID, ...env } = process.env;
+		exec(cmd, { cwd, env, timeout: timeoutSec * 1000, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
+			const full = `${stdout}${stderr}`;
+			const code = err ? (typeof err.code === 'number' ? err.code : undefined) : 0;
+			if (!err && filteredNoMatch(cmd, full)) {
+				resolve({ cmd, ok: false, code, output: clean(`${tail(full)}\njarvis-code: the test filter matched no tests, so this check proves nothing`) });
+				return;
+			}
+			resolve({ cmd, ok: !err, code, output: clean(tail(full) || (err ? err.message : '')) });
 		});
 	});
 }
 
-// --- Foreman ------------------------------------------------------------------------
+// --- the native store ------------------------------------------------------------------
 
-export interface FmResult {
-	code: number;
-	stdout: string;
-	stderr: string;
-}
-
-/**
- * Foreman as the task backend, through its CLI (`fm … --json`). Foreman state is never
- * written directly; briefs are only read for their criteria, steps and execution prompt,
- * which `fm task show --json` does not carry.
- */
-export class ForemanSource implements TaskSource {
-	readonly name = 'foreman';
+/** jarvis-code's own task store as the queue: attempts, evidence and outcomes are kept per task. */
+export class StoreSource implements TaskSource {
+	readonly name = 'store';
 	constructor(
-		private bin: string,
+		readonly project: Project,
 		private cwd: string,
 		private timeoutSec: number,
-		private log: (s: string) => void = () => {},
 	) {}
 
-	fm(args: string[], timeoutSec = 120): Promise<FmResult> {
-		return new Promise((resolve) => {
-			execFile(this.bin, args, { cwd: this.cwd, timeout: timeoutSec * 1000, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
-				// execFile's `code` is the exit status, or a string like ENOENT when it never ran.
-				const c = (err as { code?: number | string } | null)?.code;
-				const code = !err ? 0 : typeof c === 'number' ? c : c === 'ENOENT' ? 127 : 1;
-				resolve({ code, stdout, stderr: stderr || (err?.message ?? '') });
-			});
-		});
-	}
-
-	/** `fm init` is idempotent: it makes this directory a Foreman project if it is not one yet. */
-	async init(): Promise<void> {
-		const r = await this.fm(['init']);
-		if (r.code !== 0) throw new Error(`fm init: ${(r.stderr || r.stdout).trim().split('\n').pop()}`);
-	}
-
-	private async json<T>(args: string[]): Promise<T> {
-		const r = await this.fm([...args, '--json']);
-		if (r.code !== 0) throw new Error(`fm ${args.join(' ')}: ${(r.stderr || r.stdout).trim().split('\n').pop()}`);
-		return JSON.parse(r.stdout) as T;
-	}
-
 	async next(skip: ReadonlySet<string>): Promise<Task[]> {
-		const q = await this.json<{ order: { id: string; title: string; type: string; tier: string; status: string; path?: string }[] }>(['queue']);
-		return q.order.filter((t) => !skip.has(t.id) && t.status !== 'done').map((t) => ({ ...t, ...readBrief(t.path) }));
+		return this.project
+			.queue()
+			.filter((t) => !skip.has(t.id))
+			.map((t) => ({ id: t.id, title: t.title, type: t.type, tier: t.tier, acs: t.acs, steps: t.steps, brief: t.brief, hint: t.hint, depends: t.depends, source: t.source, files: t.files }));
 	}
 
-	async add(plan: PlannedTask[]): Promise<string[]> {
-		const ids = new Map<string, string>();
-		const out: string[] = [];
-		for (const [i, t] of plan.entries()) {
-			const args = ['task', 'new', t.title, '--type', (t.type ?? 'FEATURE').toUpperCase(), '--tier', (t.tier ?? 'S').toUpperCase(), '--source', 'user'];
-			for (const ac of t.acs ?? []) args.push('--ac', ac.verify ? `${ac.text} :: ${ac.verify}` : ac.text);
-			for (const s of t.steps ?? []) args.push('--step', s);
-			const deps = (t.depends ?? []).map((d) => ids.get(d) ?? d).filter((d) => /^T-\d+$/.test(d));
-			if (deps.length) args.push('--depends', deps.join(','));
-			const made = await this.json<{ id: string }>(args);
-			ids.set(t.key ?? `t${i + 1}`, made.id);
-			if (t.notes) await this.fm(['task', 'set', made.id, '--section', 'Execution prompt', '--text', t.notes]);
-			out.push(made.id);
-		}
-		return out;
+	async add(plan: PlannedTask[], goal?: string): Promise<string[]> {
+		return this.project.add(plan, { goal, source: 'plan' }).map((t) => t.id);
 	}
 
 	async start(task: Task): Promise<void> {
-		// Focus is Foreman's "one active task"; a brief not planned enough for its tier is
-		// refused focus, which only matters to Foreman's own hooks — the worker runs anyway.
-		const r = await this.fm(['focus', task.id]);
-		if (r.code !== 0) this.log(`fm focus ${task.id}: ${(r.stderr || r.stdout).trim().split('\n').pop()}`);
+		this.project.setStatus(task.id, 'active');
 	}
 
-	async check(task: Task): Promise<Check[]> {
+	async check(task: Task, cwd = this.cwd): Promise<Check[]> {
 		const out: Check[] = [];
 		for (const [i, ac] of task.acs.entries()) {
 			if (!ac.verify) continue;
-			// fm runs the command and records it as evidence; its exit code is the check's.
-			const r = await this.fm(['task', 'evidence', task.id, '--ac', String(i + 1), '--run', ac.verify, '--timeout', String(this.timeoutSec)], this.timeoutSec + 30);
-			out.push({ cmd: ac.verify, ok: r.code === 0, output: tail(`${r.stdout}${r.stderr}`) });
+			const c = await shell(ac.verify, cwd, this.timeoutSec);
+			out.push(c);
+			this.project.update(task.id, (t) => {
+				t.evidence.push({ at: new Date().toISOString(), kind: 'ac', n: i + 1, cmd: c.cmd, ok: c.ok, output: c.output.slice(-600) });
+				if (t.acs[i]) t.acs[i].checked = c.ok;
+			});
+			this.project.log({ event: 'check', id: task.id, n: i + 1, ok: c.ok });
 		}
 		return out;
 	}
 
 	async close(task: Task, checks: Check[], note: string): Promise<{ closed: boolean; message: string }> {
-		const cmds = checks.map((c) => c.cmd);
-		const args =
-			task.tier.toUpperCase() === 'S'
-				? ['task', 'finish', task.id, '--run', cmds.length ? cmds.join(' && ') : 'git status --short', '--audit', note, '--timeout', String(this.timeoutSec)]
-				: ['task', 'done', task.id];
-		const r = await this.fm(args, this.timeoutSec + 30);
-		const message = (r.stderr || r.stdout).trim().split('\n').pop() ?? '';
-		return { closed: r.code === 0, message };
+		this.project.update(task.id, (t) => {
+			t.status = 'done';
+			t.reason = undefined;
+			t.evidence.push({ at: new Date().toISOString(), kind: 'note', ok: true, output: note });
+		});
+		this.project.log({ event: 'done', id: task.id, checks: checks.length });
+		return { closed: true, message: 'done' };
 	}
 
 	async block(task: Task, reason: string): Promise<void> {
-		await this.fm(['task', 'block', task.id, reason.slice(0, 500)]);
+		this.project.setStatus(task.id, 'blocked', reason);
 	}
-}
 
-/** Criteria, steps and execution prompt out of a Foreman brief. */
-export function readBrief(path: string | undefined): Pick<Task, 'acs' | 'steps' | 'brief' | 'depends'> {
-	let md = '';
-	try {
-		if (path) md = readFileSync(path, 'utf8');
-	} catch {
-		/* a brief we cannot read is worked from its title */
+	async hold(task: Task, reason: string): Promise<void> {
+		this.project.setStatus(task.id, 'review', reason);
 	}
-	const section = (name: string) => {
-		const m = md.match(new RegExp(`^## ${name}[^\\n]*\\n([\\s\\S]*?)(?=^## |$(?![\\s\\S]))`, 'm'));
-		return m ? m[1].trim() : '';
-	};
-	const acs = section('Acceptance criteria')
-		.split('\n')
-		.map((l) => l.match(/^- \[[ x]\] (.*?)(?: — verify with `(.+)`)?\s*$/))
-		.filter((m): m is RegExpMatchArray => !!m)
-		.map((m) => ({ text: m[1], verify: m[2] }));
-	const steps = section('Steps')
-		.split('\n')
-		.map((l) => l.match(/^\d+\. \[[ x]\] (.*?)(?:\s+<- CURRENT)?\s*$/)?.[1])
-		.filter((s): s is string => !!s);
-	const brief = [section('Execution prompt'), section('Interpretation')].filter(Boolean).join('\n\n') || undefined;
-	const depends = md.match(/^depends_on: \[(.*)\]$/m)?.[1].split(',').map((d) => d.trim()).filter(Boolean) ?? [];
-	return { acs, steps, brief, depends };
+
+	async requeue(task: Task): Promise<void> {
+		if (this.project.get(task.id)?.status === 'active') this.project.setStatus(task.id, 'planned');
+	}
+
+	research(name: string, content: string): string {
+		return this.project.research(name, content);
+	}
+
+	notes(task: Task, lessons: string[], followUps: string[]): string[] {
+		if (lessons.length) this.project.update(task.id, (t) => (t.lessons = [...new Set([...t.lessons, ...lessons])].slice(-20)));
+		// Found out of scope: kept, not run. The user queues them with `jarvis-code task retry`.
+		const goal = this.project.get(task.id)?.goal;
+		return this.project.add(followUps.map((title) => ({ title, type: /\b(fix|bug|broken|crash|fails?)\b/i.test(title) ? 'FIX' : 'FEATURE' })), { goal, source: 'followup', status: 'deferred', reason: `found while working ${task.id}` }).map((t) => t.id);
+	}
+
+	lessons(limit?: number): string[] {
+		return this.project.lessons(limit);
+	}
+
+	sizing(): string | undefined {
+		return this.project.firstTry();
+	}
+
+	async split(task: Task, plan: PlannedTask[], why: string): Promise<string[]> {
+		const ids = this.project.add(plan, { goal: this.project.get(task.id)?.goal, source: 'replan' }).map((t) => t.id);
+		this.project.setStatus(task.id, 'dropped', `split into ${ids.join(', ')}: ${why}`);
+		for (const t of this.project.tasks())
+			if (t.depends.includes(task.id)) this.project.update(t.id, (x) => (x.depends = [...new Set(x.depends.flatMap((d) => (d === task.id ? ids : [d])))]));
+		return ids;
+	}
+
+	attempt(task: Task, a: Attempt): void {
+		this.project.update(task.id, (t) => t.attempts.push(a));
+		this.project.log({ event: 'attempt', id: task.id, route: a.route, ok: a.ok, cause: a.cause });
+	}
+
+	beat(a: { at: number; kind: string; text: string; task?: string }): void {
+		this.project.beat(a);
+	}
 }
 
 // --- in memory ------------------------------------------------------------------------
 
-/** Tasks held in the process: the demo, tests, and running without Foreman. */
+/** Tasks held in the process: the demo, tests, and `--tasks memory`. */
 export class MemorySource implements TaskSource {
 	readonly name = 'memory';
-	tasks: (Task & { status: 'open' | 'done' | 'blocked'; depends: string[]; reason?: string })[] = [];
+	tasks: (Task & { status: 'open' | 'done' | 'blocked' | 'split'; depends: string[]; reason?: string })[] = [];
 	private n = 0;
 	constructor(private cwd: string, private timeoutSec: number) {}
 
@@ -206,7 +225,14 @@ export class MemorySource implements TaskSource {
 		return this.tasks.filter((t) => t.status === 'open' && !skip.has(t.id));
 	}
 
-	async add(plan: PlannedTask[]): Promise<string[]> {
+	async split(task: Task, plan: PlannedTask[], why: string): Promise<string[]> {
+		const ids = await this.add(plan, undefined, 'replan');
+		Object.assign(this.find(task), { status: 'split', reason: `split into ${ids.join(', ')}: ${why}` });
+		for (const t of this.tasks) t.depends = [...new Set(t.depends.flatMap((d) => (d === task.id ? ids : [d])))];
+		return ids;
+	}
+
+	async add(plan: PlannedTask[], _goal?: string, source?: string): Promise<string[]> {
 		const keys = new Map<string, string>();
 		return plan.map((p, i) => {
 			const id = `M-${String(++this.n).padStart(4, '0')}`;
@@ -219,7 +245,9 @@ export class MemorySource implements TaskSource {
 				acs: p.acs ?? [],
 				steps: p.steps ?? [],
 				brief: p.notes,
+				files: p.files,
 				status: 'open',
+				source,
 				depends: (p.depends ?? []).map((d) => keys.get(d) ?? d),
 			});
 			return id;
@@ -228,10 +256,14 @@ export class MemorySource implements TaskSource {
 
 	async start(): Promise<void> {}
 
-	async check(task: Task): Promise<Check[]> {
+	async check(task: Task, cwd = this.cwd): Promise<Check[]> {
 		const out: Check[] = [];
-		for (const ac of task.acs) if (ac.verify) out.push(await shell(ac.verify, this.cwd, this.timeoutSec));
+		for (const ac of task.acs) if (ac.verify) out.push(await shell(ac.verify, cwd, this.timeoutSec));
 		return out;
+	}
+
+	async hold(task: Task, reason: string): Promise<void> {
+		Object.assign(this.find(task), { status: 'blocked', reason });
 	}
 
 	async close(task: Task): Promise<{ closed: boolean; message: string }> {

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { stripVTControlCharacters as strip } from 'node:util';
 import { ease, large, ring, spinner, RING } from '../src/reactor.js';
-import { colorDepth } from '../src/theme.js';
+import { colorDepth, mix, palette, rgb } from '../src/theme.js';
 
 const tc = { depth: 'truecolor' as const, tempo: 3 };
 
@@ -32,14 +32,16 @@ test('large reactor animates while working and holds still when stopped', () => 
 });
 
 test('plan progress lights the level arc and dims finished blades', () => {
-	const count = (s: string, hex: string) => {
-		const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
-		return s.split(`38;2;${r};${g};${b}m`).length - 1;
-	};
-	const none = large('tool', 0, 15, { depth: 'truecolor', segments: 8, done: 0 }).join('');
-	const half = large('tool', 0, 15, { depth: 'truecolor', segments: 8, done: 4 }).join('');
-	// Finished blades are text-dim at full light; nothing is finished at 0/8.
-	assert.equal(count(none, '#7c9ea9') < count(half, '#7c9ea9'), true);
+	// Finished blades are text-dim at 85% light; count cells painted exactly that colour.
+	const [r, g, b] = mix(rgb(palette.housing[0]), rgb(palette.textDim[0]), 0.85);
+	const finished = (s: string) => s.split(`38;2;${r};${g};${b}m`).length - 1;
+	const none = large('tool', 0, 15, { depth: 'truecolor', style: 'braille', segments: 8, done: 0 }).join('');
+	const half = large('tool', 0, 15, { depth: 'truecolor', style: 'braille', segments: 8, done: 4 }).join('');
+	assert.equal(finished(none), 0);
+	assert.ok(finished(half) > 5, `only ${finished(half)} finished-blade runs`);
+	// Progress lights the level arc: more live-colour cells at 4/8 than at 0/8.
+	const live = (s: string) => s.split('38;2;').length;
+	assert.ok(live(half) >= live(none));
 });
 
 test('no colour means no escapes', () => {
@@ -63,4 +65,31 @@ test('colour depth follows NO_COLOR, COLORTERM, TERM', () => {
 	assert.equal(colorDepth({ TERM: 'xterm-256color' }), '256');
 	assert.equal(colorDepth({ TERM: 'xterm' }), '16');
 	assert.equal(colorDepth({ TERM: 'xterm' }, false), 'none');
+});
+
+test('geometry holds still between frames: the reactor moves light, not dots', () => {
+	for (const style of ['blocks', 'braille'] as const)
+		for (const state of ['tool', 'thinking', 'idle', 'attention'] as const) {
+			const at = (t: number) => large(state, t, 13, { ...tc, style, segments: 7, done: 2 });
+			const base = strip(at(10).join('\n'));
+			for (let f = 1; f <= 12; f++) assert.equal(strip(at(10 + f / 24).join('\n')), base, `${style} ${state} frame ${f} moved dots`);
+			// ...while the colours do move: it is still animated.
+			assert.notEqual(at(10).join(''), at(10.5).join(''), `${style} ${state} is not animated`);
+		}
+});
+
+test('blocks: half-block pixels on a round lens, corners left to the terminal', () => {
+	const out = large('tool', 1, 15, { ...tc, style: 'blocks' });
+	assert.equal(out.length, 15);
+	for (const line of out) assert.equal([...strip(line)].length, 30);
+	assert.ok(strip(out[0]).startsWith(' '), 'the top-left corner is outside the lens');
+	assert.ok(out.join('').includes('48;2;'), 'full cells carry a background colour: two pixels per cell');
+	assert.match(strip(out[7]), /^[▀▄]/, 'the lens reaches the left edge at the middle row');
+});
+
+test('a state change crossfades colours instead of cutting', () => {
+	const at = (since: number) => large('alert', 5, 13, { ...tc, prev: 'tool', since }).join('');
+	assert.notEqual(at(0.05), at(2), 'mid-fade differs from the settled state');
+	assert.equal(strip(at(0.05)), strip(at(2)), 'and still only colour changes');
+	assert.equal(large('alert', 5, 13, { ...tc, prev: 'alert', since: 0.05 }).join(''), large('alert', 5, 13, { ...tc, since: 0.05 }).join(''));
 });

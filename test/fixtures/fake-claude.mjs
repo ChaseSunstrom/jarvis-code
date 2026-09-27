@@ -38,8 +38,8 @@ rl.on('line', (raw) => {
 	out({ type: 'system', subtype: 'model_refusal_fallback', trigger: 'refusal', direction: 'sticky', scope: 'session', original_model: model, fallback_model: 'claude-opus-4-8', request_id: 'r1', api_refusal_category: 'cyber', uuid: 'u1', session_id: 's-1' });
 	model = 'claude-opus-4-8';
 	// The turn goes on (on the fallback model) whether or not a switch arrives.
-	const t = setTimeout(() => finish(`done on ${model}`), 1500);
-	waiting = () => { clearTimeout(t); waiting = undefined; finish(`done on ${model}`); };
+	const t = setTimeout(() => finish(process.env.FAKE_TEXT1 ?? `done on ${model}`), 1500);
+	waiting = () => { clearTimeout(t); waiting = undefined; finish(process.env.FAKE_TEXT1 ?? `done on ${model}`); };
 });
 function finish(text) {
 	out({ type: 'assistant', parent_tool_use_id: null, message: { model, content: [{ type: 'text', text }] } });
