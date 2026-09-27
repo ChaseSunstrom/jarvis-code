@@ -33,6 +33,7 @@ jarvis-code                                                   # the cockpit: eve
 jarvis-code "migrate the settings system to the new loader"   # plan, then work the tasks
 jarvis-code work                                              # work this project's open tasks
 jarvis-code improve [focus]                                   # find and make the best improvements here
+jarvis-code improve --rounds 5 --min 2                        # up to 5 rounds; one landing under 2 tasks ends it
 jarvis-code status                                            # queue + agent health
 jarvis-code tasks                                             # the queue; `task add|show|retry|defer|drop|approve`
 jarvis-code status --all --json                               # every project's queue, for scripts
@@ -55,6 +56,7 @@ projects can run at once. `/` opens the command menu:
 | `/detach` | hand the selected project's run to the background: it keeps going after you quit |
 | `/task add [TYPE:] <title>` · `/task show <id>` · `/task retry\|defer\|drop\|approve [id\|blocked\|review] [why]` · `/task bump [id]` | change the selected project's queue, or show a task's detail; a status word acts on every task in it; leave the id out to act on the open task; bump moves it to the front of the queue |
 | `/trust <route or tool>` | forget what was learned about it, so it is used again |
+| `/route [role\|TYPE\|default] [routes…\|-]` | the routing table, or set the agents a role or task type uses from the next run; this session only, `-` clears one |
 | `/report` | the run's report: every task's outcome, what was learned and found |
 | `/reports` | this project's past run reports, newest first |
 | `/graph` · `/tree` | in a run: its planning pipeline and every agent run in it · its tasks by dependency (Esc closes) |
@@ -84,7 +86,7 @@ carries the same facts as `died` and `lastEventAt` fields, for scripts.
 `--budget USD` and `--max-minutes N` cap one run: past either, jarvis-code stops dispatching and
 kills its workers, and the unfinished tasks stay queued for `jarvis-code work`.
 
-`improve --plain` (and `improve --detach`) runs rounds: each is an ordinary run whose goal names
+`improve` (in the cockpit, `--plain` or `--detach`, and the cockpit's `/improve`) runs rounds: each is an ordinary run whose goal names
 what the last round closed and asks for what comes next. `--rounds N` caps them (default 3) and
 `--min K` ends the loop after a round that lands fewer than K tasks (default 1); a stopped or
 capped run ends it too. Each round's outcome and the reason the loop ended are printed.
@@ -171,8 +173,8 @@ Workers end with notes that jarvis-code keeps:
 
 ### Planning
 
-With `planning.mode` `auto` (the default), a goal goes through three stages before any code is
-written:
+With `planning.mode` `auto` (the default), a goal goes through up to four stages before any code
+is written:
 
 1. **Prompt writer.** One agent reads the repository and writes the prompt the planner will work
    from: the goal restated precisely, the files and commands that matter, what done looks like,
@@ -183,10 +185,14 @@ written:
    Rounds stop when one adds fewer than `minNew` new ideas, or after `rounds`.
    Brainstormers read the code their ideas touch, read-only (Claude Code without its edit tools,
    Codex in `--sandbox read-only`, OpenCode's `plan` agent), and cite a file per idea. A `generic`
-   agent has no read-only mode, so as a brainstormer it can change files.
-3. **Planner.** It runs on a different agent from the prompt writer when you have one. It gets
+   agent has no read-only mode, so as a brainstormer it can change files. Near-duplicate ideas
+   are merged into one.
+3. **Critique** (`planning.critique`). A critic on another route checks each idea against the
+   code, read-only, and scores its value, effort and risk. The planner gets the ideas best first.
+   A critic that gives no usable scores leaves them unranked.
+4. **Planner.** It runs on a different agent from the prompt writer when you have one. It gets
    the prompt and the ideas, keeps the best value for the effort, and plans that.
-4. **Coverage** (`planning.coverage`). Once the tasks settle, an agent on a reviewer route checks
+5. **Coverage** (`planning.coverage`). Once the tasks settle, an agent on a reviewer route checks
    each done item (the prompt writer's, plus the goal's `DONE-WHEN:` lines) against what landed.
    Unmet items are planned into follow-up tasks and worked in the same run, once. `/graph` lists
    each item under the goal as met, unmet or open, with the tasks that cover it.

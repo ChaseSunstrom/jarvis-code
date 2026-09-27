@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig, merge, normalize, type Config } from './config.js';
 import { Learning } from './learn.js';
 import { Orchestrator, type Snapshot } from './orchestrator.js';
+import { improveGoal, nextRound } from './pipeline.js';
 import { claudeInstalled, PLUGIN_DIR } from './plugin.js';
 import { Project, type QueuedGoal } from './store.js';
 import { MemorySource, StoreSource, type TaskSource } from './tasks.js';
@@ -33,6 +34,23 @@ export interface StartOptions {
 	memory?: boolean;
 	/** Config overrides (CLI flags) merged over the project's own config. */
 	overrides?: unknown;
+}
+
+export interface ImproveOptions {
+	focus?: string;
+	/** At most this many rounds; a round landing fewer than `minLanded` tasks ends the loop. */
+	rounds: number;
+	minLanded: number;
+	/** Config overrides for every round, as start()'s; the rounds add deep planning. */
+	overrides?: unknown;
+}
+
+/** How an improve loop ended: `error` when the next round could not start. */
+export interface Improved {
+	dir: string;
+	round: number;
+	reason: 'stopped' | 'dry' | 'rounds';
+	error?: string;
 }
 
 /**
@@ -92,6 +110,9 @@ export function demoConfig(base: Config, fast: boolean): Config {
 	);
 }
 
+/** Finished runs the manager remembers; older ones are dropped. */
+export const KEEP_FINISHED = 5;
+
 /**
  * Every run the cockpit started, one per project directory at a time (two runs in one
  * working tree would edit the same files). Runs share one Learning, so what one project
@@ -105,6 +126,15 @@ export class RunManager extends EventEmitter {
 		private base: { overrides?: unknown } = {},
 	) {
 		super();
+	}
+
+	/**
+	 * Forget all but the newest KEEP_FINISHED finished runs: each Orchestrator holds its activity,
+	 * nodes and patches, and a cockpit left open for hours starts many runs. Never drops one going.
+	 */
+	prune(): void {
+		const finished = this.list().filter((r) => r.finished);
+		for (const r of finished.slice(0, -KEEP_FINISHED)) this.runs.delete(r.id);
 	}
 
 	list(): Run[] {
@@ -122,7 +152,8 @@ export class RunManager extends EventEmitter {
 			.at(-1);
 	}
 
-	async start(dir: string, opts: StartOptions = {}): Promise<Run> {
+	/** `then` runs once the run ended and the project is unlocked: by default, the next queued goal. */
+	async start(dir: string, opts: StartOptions = {}, then?: (run: Run, project: Project) => Promise<void>): Promise<Run> {
 		const abs = resolve(dir);
 		const busy = this.active().find((r) => r.dir === abs);
 		if (busy) throw new Error(`${basename(abs)} already has a run going (#${busy.id}); /stop it first`);
@@ -133,8 +164,33 @@ export class RunManager extends EventEmitter {
 		project?.lock({ goal: opts.goal, by: 'cockpit' });
 		const run = this.launch(abs, config, src, opts.goal);
 		run.warnings = warnings;
-		if (project) void run.done.finally(() => project.unlock()).then(() => this.drain(abs, run, project, opts));
+		const after = then ?? ((r: Run, p: Project) => this.drain(abs, r, p, opts));
+		if (project) void run.done.finally(() => project.unlock()).then(() => after(run, project));
 		return run;
+	}
+
+	/**
+	 * The improve loop: rounds of improveGoal with deep planning, each an ordinary run building on
+	 * what the last one closed, until nextRound ends them; then emits `improved` (an Improved).
+	 * Goals queued meanwhile wait for the loop to end, then drain as after any run.
+	 */
+	async improve(dir: string, opts: ImproveOptions, round = 1, built: string[] = []): Promise<Run> {
+		const overrides = merge(opts.overrides ?? {}, { planning: { mode: 'deep' } });
+		return this.start(dir, { goal: improveGoal(opts.focus, built), overrides }, async (run, project) => {
+			const s = run.o.snapshot();
+			const done = s.tasks.filter((t) => t.status === 'done').map((t) => t.title);
+			const reason = nextRound({ round, rounds: opts.rounds, landed: done.length, minLanded: opts.minLanded, stopped: s.phase === 'stopped' || !!s.error });
+			let error: string | undefined;
+			if (!reason)
+				try {
+					await this.improve(dir, opts, round + 1, done);
+					return;
+				} catch (e) {
+					error = (e as Error).message;
+				}
+			this.emit('improved', { dir: run.dir, round, reason: reason ?? 'stopped', ...(error && { error }) } satisfies Improved);
+			await this.drain(run.dir, run, project, { overrides: opts.overrides });
+		});
 	}
 
 	/**
@@ -145,8 +201,14 @@ export class RunManager extends EventEmitter {
 	async submit(dir: string, opts: StartOptions = {}): Promise<{ run?: Run; queued?: number }> {
 		const abs = resolve(dir);
 		// A demo has no store to queue in (nor a drain): it keeps start()'s error.
-		if (opts.goal && !opts.memory && (this.active().some((r) => r.dir === abs && !r.demo) || Project.open(abs)?.running())) return { queued: new Project(abs).enqueue(opts.goal) };
+		if (opts.goal && !opts.memory && this.busy(abs)) return { queued: new Project(abs).enqueue(opts.goal) };
 		return { run: await this.start(abs, opts) };
+	}
+
+	/** The project has a run going, here (not a demo) or in another process. */
+	busy(dir: string): boolean {
+		const abs = resolve(dir);
+		return this.active().some((r) => r.dir === abs && !r.demo) || !!Project.open(abs)?.running();
 	}
 
 	/** Goals waiting for the project's run to end, oldest first. */
@@ -205,6 +267,7 @@ export class RunManager extends EventEmitter {
 		o.on('activity', (a) => this.emit('activity', run, a));
 		run.done = o.run(goal).finally(() => {
 			run.finished = true;
+			this.prune();
 			this.emit('finished', run);
 			this.emit('update');
 		});

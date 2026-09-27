@@ -11,7 +11,7 @@ import { createElement } from 'react';
 import { render } from 'ink-testing-library';
 import { DEFAULTS, merge, normalize } from '../src/config.js';
 import { Learning } from '../src/learn.js';
-import { RunManager } from '../src/runs.js';
+import { KEEP_FINISHED, RunManager } from '../src/runs.js';
 import { Project, type StoredTask } from '../src/store.js';
 import { Cockpit, matchCommands } from '../src/tui/Cockpit.js';
 import { Feed, Header, Tasks } from '../src/tui/parts.js';
@@ -22,6 +22,11 @@ import { PAGER_MAX, pageLines, Pager } from '../src/tui/pager.js';
 import { c } from '../src/theme.js';
 import type { Snapshot } from '../src/orchestrator.js';
 import { sampleSnapshot } from './sample-snapshot.js';
+
+// ink-testing-library's stdout has no rows, so Ink asks the real terminal (env, then /dev/tty):
+// in a tall one a /diff patch fits one page and PgDn has nothing to scroll. Pin the classic size.
+process.env.COLUMNS = '100';
+process.env.LINES = '24';
 
 const demoAgent = fileURLToPath(new URL('../src/demo-agent.js', import.meta.url));
 const cli = fileURLToPath(new URL('../src/cli.js', import.meta.url));
@@ -188,6 +193,26 @@ test('two projects run at once', async () => {
 	await assert.rejects(manager.start(dirs[0], { goal: 'again' }), /already has a run/);
 	await Promise.all(runs.map((r) => r.done));
 	for (const r of runs) assert.ok(r.o.snapshot().tasks.every((t) => t.status === 'done'));
+});
+
+test('RunManager keeps only the newest finished runs', async () => {
+	const { manager, root } = machine();
+	// An older run still going (id 0, before any real one): prune must never drop it.
+	const going = { id: 0, dir: join(root, 'going'), name: 'going', o: undefined as never, done: new Promise<never>(() => {}), finished: false };
+	manager.runs.set(0, going);
+	const dirs = Array.from({ length: KEEP_FINISHED + 3 }, (_, i) => join(root, `p${i}`));
+	for (const d of dirs) {
+		mkdirSync(d);
+		// No goal and an empty memory queue: the run finishes at once, and launch() prunes.
+		await (await manager.start(d, { memory: true })).done;
+	}
+	const finished = manager.list().filter((r) => r.finished);
+	assert.equal(finished.length, KEEP_FINISHED);
+	assert.deepEqual(finished.map((r) => r.dir), dirs.slice(-KEEP_FINISHED), 'the newest finished runs survive');
+	assert.deepEqual(manager.active(), [going], 'the run still going is kept');
+	assert.equal(manager.inDir(dirs.at(-1)!)?.finished, true);
+	assert.equal(manager.inDir(dirs[0]), undefined, 'the oldest was dropped');
+	assert.ok(manager.inDir(dirs.at(-1)!)!.o.snapshot(), 'a kept finished run still has its snapshot');
 });
 
 test('the agents panel fits its height: two rows each, then one, then a count', () => {

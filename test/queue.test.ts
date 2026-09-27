@@ -7,7 +7,8 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { DEFAULTS, merge, normalize } from '../src/config.js';
 import { Learning } from '../src/learn.js';
-import { RunManager } from '../src/runs.js';
+import { improveGoal } from '../src/pipeline.js';
+import { RunManager, type Improved } from '../src/runs.js';
 import { Project } from '../src/store.js';
 
 const demoAgent = fileURLToPath(new URL('../src/demo-agent.js', import.meta.url));
@@ -87,4 +88,41 @@ test('run queue: a run held by another process queues the goal', async () => {
 	} finally {
 		project.unlock(process.ppid);
 	}
+});
+
+test('improve rounds: each round is a deep-planned run on what the last landed, until the cap, a dry round or a stop; queued goals wait for the end', async (t) => {
+	const { proj, manager } = machine();
+	t.after(() => manager.stopAll());
+	const ended: { e: Improved; queue: string[] }[] = [];
+	manager.on('improved', (e: Improved) => ended.push({ e, queue: manager.queued(e.dir).map((g) => g.goal) }));
+	const first = await manager.improve(proj, { focus: 'q', rounds: 2, minLanded: 1 });
+	assert.equal(first.goal, improveGoal('q'));
+	assert.equal(first.o.config.planning.mode, 'deep', 'rounds plan deep');
+	assert.deepEqual(await manager.submit(proj, { goal: 'after' }), { queued: 1 });
+	await until(() => ended.length === 1);
+	assert.deepEqual(ended[0], { e: { dir: proj, round: 2, reason: 'rounds' }, queue: ['after'] }, 'the queued goal waits for the loop, not for a round');
+	const [one, two] = manager.list();
+	assert.equal(two.goal, improveGoal('q', ['Make q']), 'round 2 builds on what round 1 closed');
+	assert.equal(two.o.config.planning.mode, 'deep');
+	await until(() => manager.list().length === 3);
+	assert.equal(manager.inDir(proj)!.goal, 'after', 'then the queue drains');
+	assert.equal(manager.inDir(proj)!.o.config.planning.mode, 'direct', 'as a plain goal');
+	await manager.inDir(proj)!.done;
+	assert.ok(one.finished && two.finished);
+
+	await manager.improve(proj, { rounds: 3, minLanded: 5 });
+	await until(() => ended.length === 2);
+	assert.deepEqual(ended[1].e, { dir: proj, round: 1, reason: 'dry' });
+	await sleep(100);
+	assert.equal(manager.list().length, 4, 'a dry round starts no other');
+
+	const slow = machine('300');
+	t.after(() => slow.manager.stopAll());
+	const stopped: Improved[] = [];
+	slow.manager.on('improved', (e: Improved) => stopped.push(e));
+	const run = await slow.manager.improve(slow.proj, { rounds: 3, minLanded: 0 });
+	slow.manager.stop(run);
+	await until(() => stopped.length === 1);
+	assert.deepEqual(stopped, [{ dir: slow.proj, round: 1, reason: 'stopped' }]);
+	assert.equal(slow.manager.list().length, 1, 'a stop ends the loop');
 });

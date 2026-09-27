@@ -347,6 +347,17 @@ export function workerPrompt(task: Task, cwd: string, extra: { previous?: string
 
 const stamp = () => new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
 
+/** Longest activity detail kept: the full patch stays in `patches` for /diff, and the feed only shows the first 6 lines of a change. */
+export const DETAIL_MAX = 8000;
+
+/**
+ * A copy of `s` that shares no memory with the string it came from. V8's slice() and `+` return
+ * views that keep the whole source alive, so a 300-char error or an 8000-char detail cut from a
+ * 1 MB agent output kept all 1 MB in each of a run's 1000 feed entries. That is how a cockpit
+ * reached 4 GB in one long run (scripts/soak-cockpit.mjs OOMed at 256 MB in 2 s before this).
+ */
+const own = (s: string): string => JSON.parse(JSON.stringify(s));
+
 /** Dependency directories a worktree shares with the main tree so checks can run there. ponytail: a fixed list; a config key when a stack needs another. */
 const LINKS = ['node_modules', '.venv', 'venv', 'vendor'];
 
@@ -493,7 +504,10 @@ export class Orchestrator extends EventEmitter {
 	}
 
 	note(kind: ActivityKind, text: string, extra: { detail?: string; task?: string } = {}) {
-		const a: Activity = { at: Date.now(), kind, text, ...extra };
+		const a: Activity = { at: Date.now(), kind, text: own(text), ...extra };
+		// The head plus a trailer, which the 40 held back leaves room for, so no detail passes DETAIL_MAX.
+		if (a.detail && a.detail.length > DETAIL_MAX) a.detail = `${a.detail.slice(0, DETAIL_MAX - 40)}\n… (${a.detail.length - DETAIL_MAX + 40} more chars)`;
+		if (a.detail) a.detail = own(a.detail);
 		this.activity.push(a);
 		if (this.activity.length > 1000) this.activity.splice(0, this.activity.length - 1000);
 		this.emit('activity', a);

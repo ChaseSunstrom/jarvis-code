@@ -25,8 +25,8 @@ Usage
   jarvis-code                     the cockpit: every project, runs, a prompt for goals and /commands
   jarvis-code "<goal>"            plan the goal into tasks, then work them (opens the cockpit on the run)
   jarvis-code work                work this project's open tasks, no planning
-  jarvis-code improve [focus]     find and make the most valuable improvements here (brainstormed first);
-                                  with --plain, rounds that each build on the last until one lands too little
+  jarvis-code improve [focus]     find and make the most valuable improvements here (brainstormed first),
+                                  in rounds that each build on the last until one lands too little
   jarvis-code demo                simulated agents: see the TUI, learning and re-upgrades (no API calls)
   jarvis-code status              the queue, the agents and their learned health
   jarvis-code stop                end this project's background or CLI run
@@ -184,7 +184,7 @@ async function main(argv: string[]) {
 			const goal = improveGoal(focus);
 			const deep = { planning: { mode: 'deep' } };
 			if (f.detach) return detach(cwd, argv, f.tasks);
-			if (tui) return cockpit(config, cwd, overrides, (m) => m.start(cwd, { goal, overrides: deep }));
+			if (tui) return cockpit(config, cwd, overrides, (m) => m.improve(cwd, { focus, ...config.improve }));
 			return run(normalize(merge(config, deep)), cwd, goal, f.tasks, { focus });
 		}
 		case 'work':

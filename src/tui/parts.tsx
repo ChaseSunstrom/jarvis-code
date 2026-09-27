@@ -1,5 +1,6 @@
-import { Box, Text } from 'ink';
+import { Box, Text, Transform } from 'ink';
 import { basename } from 'node:path';
+import { stripVTControlCharacters } from 'node:util';
 import type { ReactElement } from 'react';
 import type { Config } from '../config.js';
 import type { Learning as LearningStore } from '../learn.js';
@@ -43,10 +44,16 @@ export function ReactorView({ snap, t, rows, depth, tempo, style }: { snap: Snap
 		goal: !!snap.goal && snap.phase !== 'finished',
 	};
 	const lines = rows > 2 ? large(snap.reactor, t, rows, opts) : ring(snap.reactor, t, opts);
+	// Ink keeps the size of every distinct string it measures, forever (a Map in ink 7.1.1's
+	// measure-text.js), and each animated frame is new strings: ~0.3 MB/s for as long as a run
+	// goes (scripts/soak-cockpit.mjs). A Transform is measured by its blank child, one string per
+	// width, and swaps the frame in only as it draws. Every glyph is one column wide.
 	return (
 		<Box flexDirection="column" marginRight={2}>
 			{lines.map((l, i) => (
-				<Text key={i}>{l}</Text>
+				<Transform key={i} transform={() => l}>
+					{' '.repeat(stripVTControlCharacters(l).length)}
+				</Transform>
 			))}
 		</Box>
 	);

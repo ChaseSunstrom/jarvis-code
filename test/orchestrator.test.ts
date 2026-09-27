@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { DEFAULTS, merge, normalize, type Config } from '../src/config.js';
 import { Learning } from '../src/learn.js';
-import { messageLine, Orchestrator, parsePlan, roleOf, workerContext, workerNotes, type Snapshot } from '../src/orchestrator.js';
+import { DETAIL_MAX, messageLine, Orchestrator, parsePlan, roleOf, workerContext, workerNotes, type Snapshot } from '../src/orchestrator.js';
 import { fleet } from '../src/runs.js';
 import type { Run } from '../src/runs.js';
 import { brainstormPrompt, different, looksOpen, newIdeas, parseBrief, parseIdeas } from '../src/pipeline.js';
@@ -91,6 +91,19 @@ test('a retryable attempt failure does not flash the reactor into alert', async 
 	assert.equal((await o.run('two things')).done, 2);
 	assert.ok(o.snapshot().activity.some((a) => a.kind === 'fail'), 'there were failed attempts');
 	assert.ok(!states.has('alert'), `reactor states seen: ${[...states].join(', ')}`);
+});
+
+test('activity detail stays bounded', () => {
+	const { cwd, config, learning } = setup({ workers: ['claude:claude-fable-5-1'] }, plan(1));
+	const o = new Orchestrator(config, new MemorySource(cwd, 30), learning, cwd);
+	const big = 'x\n'.repeat(512 * 1024);
+	for (let i = 0; i < 2000; i++) o.note(i % 2 ? 'change' : 'text', `note ${i}`, { detail: big });
+	o.note('change', 'short', { detail: 'diff --git a/x b/x\n+one line' });
+	const { activity } = o.snapshot();
+	assert.ok(activity.length <= 1000, `${activity.length} entries`);
+	assert.ok(activity.every((a) => (a.detail?.length ?? 0) <= DETAIL_MAX));
+	assert.match(activity.at(-2)!.detail!, /^x\nx\n[\s\S]*\n… \(\d+ more chars\)$/);
+	assert.equal(activity.at(-1)!.detail, 'diff --git a/x b/x\n+one line');
 });
 
 test('a Fable downgrade is switched back mid-task', async () => {

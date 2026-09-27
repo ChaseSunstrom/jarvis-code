@@ -8,7 +8,7 @@ import { addRecent, listProjects, StateCache, type Project, type ProjectState } 
 import { improveGoal } from '../pipeline.js';
 import { BULK, decideTask, DECISIONS, Project as Store, type Decision, type QueuedGoal } from '../store.js';
 import { spinner } from '../reactor.js';
-import { fleet, runDetached, stopElsewhere, type Run, type RunManager } from '../runs.js';
+import { fleet, runDetached, stopElsewhere, type Improved, type Run, type RunManager } from '../runs.js';
 import { c, type ColorDepth } from '../theme.js';
 import { DepTree, Graph } from './graph.js';
 import { pageLines, Pager } from './pager.js';
@@ -349,6 +349,11 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 	useEffect(() => {
 		const refresh = setInterval(() => setProjects(listProjects()), 5000);
 		refresh.unref(); // a refresh must never be what keeps the process alive
+		// React's development build (nothing sets NODE_ENV) records every component render with
+		// performance.measure(), and Node keeps each entry in its global timeline until cleared:
+		// at the cockpit's fps that grew the heap by ~1 MB/s, GBs over an hour (scripts/soak-cockpit.mjs).
+		const measures = setInterval(() => performance.clearMeasures(), 1000);
+		measures.unref();
 		const onActivity = (r: Run, a: Activity) => {
 			feed.current.push({ ...a, text: `${r.name}  ${a.text}` });
 			if (feed.current.length > 600) feed.current.splice(0, feed.current.length - 600);
@@ -358,12 +363,19 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 			states.invalidate(r.dir);
 			bump((n) => n + 1);
 		};
+		const onImproved = ({ dir, round, reason, error }: Improved) => {
+			const why = error ?? { stopped: 'the run was stopped', dry: 'a round landed too little', rounds: 'every round ran' }[reason];
+			setMsg({ text: `${basename(dir)}: improve ended after round ${round}: ${why}`, tone: error ? 'danger' : reason === 'stopped' ? 'warn' : 'ok' });
+		};
 		manager.on('activity', onActivity);
 		manager.on('finished', onFinished);
+		manager.on('improved', onImproved);
 		return () => {
 			clearInterval(refresh);
+			clearInterval(measures);
 			manager.off('activity', onActivity);
 			manager.off('finished', onFinished);
+			manager.off('improved', onImproved);
 		};
 	}, [manager, states]);
 
@@ -376,9 +388,12 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 	const say = (text: string, tone: Tone = 'info') => setMsg({ text, tone });
 	const select = (p: Project) => setSelPath(p.path);
 
-	const startRun = async (dir: string, goal?: string, overrides?: unknown) => {
+	/** `improve`: start the improve loop instead, unless the project is busy (then the goal queues). */
+	const startRun = async (dir: string, goal?: string, overrides?: unknown, improve?: { focus?: string }) => {
 		try {
-			const { run: r, queued } = await manager.submit(dir, { goal, overrides: merge({ routes: routeOver }, overrides) });
+			const routes = { routes: routeOver };
+			const { run: r, queued }: { run?: Run; queued?: number } =
+				improve && !manager.busy(dir) ? { run: await manager.improve(dir, { ...config.improve, ...improve, overrides: routes }) } : await manager.submit(dir, { goal, overrides: merge(routes, overrides) });
 			if (!r) {
 				readGoals();
 				// A queued goal is only its text: /brainstorm's and /improve's deep planning is not kept with it.
@@ -415,7 +430,7 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 				if (!arg) return say('/brainstorm needs a goal', 'warn');
 				return void startRun(here, arg, { planning: { mode: 'deep' } });
 			case 'improve':
-				return void startRun(here, improveGoal(arg || undefined), { planning: { mode: 'deep' } });
+				return void startRun(here, improveGoal(arg || undefined), { planning: { mode: 'deep' } }, { focus: arg || undefined });
 			case 'work':
 				return void startRun(here);
 			case 'queue': {
