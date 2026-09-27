@@ -1,0 +1,14 @@
+{
+  "name": "jarvis-code",
+  "owner": {
+    "name": "Chase Sunstrom"
+  },
+  "description": "jarvis-code: run Claude Code as a worker of the jarvis-code orchestrator (Foreman-driven, multi-agent).",
+  "plugins": [
+    {
+      "name": "jarvis-code",
+      "source": "./plugin",
+      "description": "Worker-side integration for the jarvis-code orchestrator."
+    }
+  ]
+}

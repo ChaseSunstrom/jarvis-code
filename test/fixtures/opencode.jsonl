@@ -1,0 +1,5 @@
+{"type":"step_start","timestamp":1,"sessionID":"ses_1","part":{"type":"step-start"}}
+{"type":"tool_use","timestamp":2,"sessionID":"ses_1","part":{"type":"tool","tool":"edit","callID":"c1","state":{"status":"completed","input":{"filePath":"src/b.ts"},"output":"ok"}}}
+{"type":"tool_use","timestamp":3,"sessionID":"ses_1","part":{"type":"tool","tool":"task","callID":"c2","state":{"status":"error","input":{"subagent_type":"general","prompt":"x"},"error":"model returned garbage"}}}
+{"type":"text","timestamp":4,"sessionID":"ses_1","part":{"type":"text","text":"All done."}}
+{"type":"step_finish","timestamp":5,"sessionID":"ses_1","part":{"type":"step-finish","cost":0.004,"tokens":{"input":10,"output":5}}}

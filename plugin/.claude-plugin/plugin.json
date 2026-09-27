@@ -1,0 +1,8 @@
+{
+  "name": "jarvis-code",
+  "version": "0.1.0",
+  "description": "Lets Claude Code work as a jarvis-code worker: learned-bad tools are refused, Foreman task state is left to the orchestrator, and nothing changes outside a jarvis-code run.",
+  "author": { "name": "Chase Sunstrom" },
+  "homepage": "https://github.com/ChaseSunstrom/jarvis-code",
+  "license": "MIT"
+}

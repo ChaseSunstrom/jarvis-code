@@ -1,0 +1,54 @@
+{
+  "name": "jarvis-code",
+  "version": "0.1.0",
+  "description": "A Foreman-driven orchestrator for Claude Code, Codex, OpenCode and other coding agents, with a Jarvis arc-reactor TUI.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "jarvis-code": "dist/src/cli.js",
+    "jc": "dist/src/cli.js"
+  },
+  "files": [
+    "dist/src",
+    "plugin",
+    ".claude-plugin",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "prepare": "tsc -p .",
+    "test": "tsc -p . && node --test --test-concurrency=1 dist/test/",
+    "verify:reactor": "node scripts/verify-reactor.mjs",
+    "start": "node dist/src/cli.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ChaseSunstrom/jarvis-code.git"
+  },
+  "dependencies": {
+    "ink": "^7.1.1",
+    "react": "^19.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "@types/react": "^19.3.0",
+    "@xterm/headless": "^6.0.0",
+    "ink-testing-library": "^4.0.0",
+    "typescript": "^7.0.2"
+  },
+  "keywords": [
+    "claude-code",
+    "codex",
+    "opencode",
+    "foreman",
+    "orchestrator",
+    "tui",
+    "ink",
+    "agents"
+  ]
+}
