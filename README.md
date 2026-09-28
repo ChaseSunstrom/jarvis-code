@@ -22,6 +22,17 @@ jarvis-code doctor                                 # what it found: agents, plug
 jarvis-code demo                                   # simulated agents: no API calls
 ```
 
+The global install is a copy of the package. To pick up a new version, such as a leak fix, run
+the install command again and restart the cockpit. A cockpit that is already running keeps
+the code it started with.
+
+A cockpit that dies with `FATAL ERROR: ... JavaScript heap out of memory` near 4 GB after about
+50 minutes is running code from before the leak fixes; with them, an hour's soak projects to
+about 51 MB of heap. If `$(npm root -g)/jarvis-code/dist/src/tui/load.js` is missing, your install
+predates them. Until the fixes are pushed, reinstall from your checkout with
+`npm run build && npm install -g .` (with `sudo` if your global prefix needs it), then quit and
+restart the cockpit.
+
 jarvis-code uses the agents you already have on `PATH` (`claude`, `codex`, `opencode`). It needs
 nothing else: tasks live under `$XDG_STATE_HOME/jarvis-code/projects/` (`JARVIS_CODE_STATE`
 moves it), and `--tasks memory` keeps a run's queue in the process instead.

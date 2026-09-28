@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -111,6 +111,23 @@ test('excerpt: backticked symbols resolve to their definitions', () => {
 
 	const capped = codeExcerpts(task('Fix `many`', { tier: 'L' }), root);
 	assert.equal((capped.match(/export function many/g) ?? []).length, 3, capped);
+});
+
+test('codeExcerpts is silent outside a git repository', () => {
+	// git writes to fd 2 directly, so only a child process shows what would land on the cockpit's terminal.
+	const dir = mkdtempSync(join(tmpdir(), 'jc-excerpt-nogit-'));
+	writeFileSync(join(dir, 'a.ts'), 'export function foo() {}\n');
+	const url = new URL('../src/excerpt.js', import.meta.url).href;
+	const snippet = `import { codeExcerpts } from '${url}'; process.stdout.write(codeExcerpts({ title: 'Fix \`foo\` and \`barBaz\`', tier: 'S', steps: ['touch \`qux\`'], acs: [], files: [] }, ${JSON.stringify(dir)}));`;
+	const r = spawnSync(process.execPath, ['--input-type=module', '-e', snippet], {
+		cwd: dir,
+		encoding: 'utf8',
+		// A repo above tmp must not make git find one.
+		env: { ...process.env, GIT_CEILING_DIRECTORIES: dirname(dir) },
+	});
+	assert.equal(r.stderr, '');
+	assert.equal(r.status, 0);
+	assert.equal(r.stdout, '');
 });
 
 test('excerpt: failing check locations', () => {

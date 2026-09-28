@@ -340,10 +340,11 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 		manager.on('finished', onFinished);
 		return () => void manager.off('finished', onFinished);
 	}, [manager, here]);
-	const inspectTask = inspect ? Store.open(run?.dir ?? here)?.get(inspect) : undefined;
-	useEffect(() => {
-		if (inspect && !inspectTask) setInspect(undefined);
-	}, [inspect, !!inspectTask]);
+	// The inspected task, read when it changes (see the effect after `snap`), never in render.
+	const [loaded, setLoaded] = useState<ReturnType<Store['get']>>();
+	const inspectTask = loaded?.id === inspect ? loaded : undefined;
+	// Bumped after /task and /tell write, so the open task is read again.
+	const [taskRev, setTaskRev] = useState(0);
 
 	const states = useMemo(() => new StateCache(), []);
 	useEffect(() => {
@@ -380,6 +381,12 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 	}, [manager, states]);
 
 	const snap: Snapshot = run ? run.o.snapshot() : fleet(manager.list()) ?? restSnapshot(config);
+	const seen = inspect && snap.tasks.find((x) => x.id === inspect);
+	useEffect(() => {
+		const task = inspect ? Store.open(run?.dir ?? here)?.get(inspect) : undefined;
+		setLoaded(task);
+		if (inspect && !task) setInspect(undefined); // the task is gone: close its pane
+	}, [inspect, run?.dir ?? here, seen && `${seen.status}:${seen.attempts}`, taskRev]);
 	const animate = !config.ui.reducedMotion && ANIMATED.has(snap.reactor);
 	useAnimation({ interval: Math.round(1000 / Math.max(1, config.ui.fps)), isActive: animate });
 	useAnimation({ interval: 250 });
@@ -460,6 +467,7 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 					return say((e as Error).message, 'danger');
 				} finally {
 					states.invalidate(here);
+					setTaskRev((n) => n + 1);
 				}
 			}
 			case 'demo': {
@@ -534,6 +542,7 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 					return say((e as Error).message, 'danger');
 				} finally {
 					states.invalidate(here);
+					setTaskRev((n) => n + 1);
 				}
 			}
 			case 'trust': {

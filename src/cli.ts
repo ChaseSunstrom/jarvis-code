@@ -217,7 +217,7 @@ async function cockpit(config: Config, cwd: string, overrides: unknown, start?: 
 	} catch (e) {
 		die((e as Error).message, 1);
 	}
-	const [{ render }, { createElement }, { Cockpit }] = await Promise.all([import('ink'), import('react'), import('./tui/Cockpit.js')]);
+	const [{ render }, { createElement }, { Cockpit }] = await (await import('./tui/load.js')).loadCockpit();
 	const ink = render(createElement(Cockpit, { manager, config, depth, focus, cwd, fast }), {
 		exitOnCtrlC: false,
 		alternateScreen: config.ui.alternateScreen,

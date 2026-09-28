@@ -81,7 +81,7 @@ function looksLikeDef(name: string, line: string): boolean {
 function symbolHits(cwd: string, name: string): { path: string; line: number }[] {
 	let stdout: string;
 	try {
-		stdout = execFileSync('git', ['grep', '-n', '-w', '-I', name, '--', '.', ':!node_modules', ':!dist'], { cwd, timeout: 5000, encoding: 'utf8' });
+		stdout = execFileSync('git', ['grep', '-n', '-w', '-I', name, '--', '.', ':!node_modules', ':!dist'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 });
 	} catch {
 		return [];
 	}

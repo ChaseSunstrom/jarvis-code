@@ -11,6 +11,9 @@ the user-facing map. `src/orchestrator.ts` is the core loop.
   then holds still. Run it after touching `src/reactor.ts` or `src/tui/`.
 - `node scripts/verify-cockpit.mjs`: drives the cockpit in a real pty (menu, /help, a run, Ctrl+C
   out). Run it after touching `src/tui/` or `src/cli.ts`.
+- `node --max-old-space-size=256 --expose-gc scripts/soak-cockpit.mjs [seconds]` (after `npm run build`):
+  floods the rendered cockpit for ~90 s and fails if its heap keeps growing. Run it after touching
+  what the cockpit renders or keeps per run.
 - `claude plugin validate plugin` and `claude plugin validate .` after touching `plugin/` or `.claude-plugin/`.
 - `node dist/src/cli.js demo --plain --fast`: quick end-to-end smoke.
 

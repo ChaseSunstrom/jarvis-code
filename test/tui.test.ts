@@ -466,6 +466,35 @@ test('cockpit: task show opens a task detail and Esc closes it', async (t) => {
 	assert.match(frame(ui), /no task T-0099 in alpha/);
 });
 
+test('the inspected task is not reread on every frame', async (t) => {
+	const { config, manager, proj } = machine();
+	const ui = render(createElement(Cockpit, { manager, config, depth: 'none', cwd: proj }));
+	t.after(() => ui.unmount());
+	await sleep(50);
+	await type(ui, '/task show T-0001');
+	ui.stdin.write('\r');
+	await sleep(60);
+	assert.match(frame(ui), /Wire the parser/);
+	const get = Project.prototype.get;
+	let reads = 0;
+	Project.prototype.get = function (this: Project, id: string) {
+		reads++;
+		return get.call(this, id);
+	};
+	try {
+		// Each keystroke re-renders the cockpit; none of them changes the task.
+		for (let i = 0; i < 25; i++) {
+			ui.stdin.write('x');
+			await sleep(10);
+		}
+		assert.match(frame(ui), /x{25}▏/, 'every keystroke rendered');
+		assert.ok(reads < 3, `the task was read ${reads} times over 25 renders`);
+	} finally {
+		Project.prototype.get = get;
+	}
+	assert.match(frame(ui), /Wire the parser/);
+});
+
 test('cockpit: with a task open the footer names its verbs', async (t) => {
 	const { config, manager, proj } = machine();
 	const ui = render(createElement(Cockpit, { manager, config, depth: 'none', cwd: proj }));
