@@ -2,18 +2,23 @@ import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 import { Box, Text, useAnimation, useApp, useInput, useWindowSize } from 'ink';
 import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
-import { agentEnabled, merge, normalize, type Config } from '../config.js';
+import { agentEnabled, loadConfig, merge, normalize, type Config } from '../config.js';
 import type { Activity, Snapshot } from '../orchestrator.js';
 import { addRecent, listProjects, StateCache, type Project, type ProjectState } from '../projects.js';
 import { improveGoal } from '../pipeline.js';
-import { BULK, decideTask, DECISIONS, Project as Store, type Decision, type QueuedGoal } from '../store.js';
+import { BULK, decideTask, DECISIONS, nextStep, Project as Store, type Decision, type QueuedGoal, type RunRecord } from '../store.js';
 import { spinner } from '../reactor.js';
 import { fleet, runDetached, stopElsewhere, type Improved, type Run, type RunManager } from '../runs.js';
 import { c, type ColorDepth } from '../theme.js';
-import { DepTree, Graph } from './graph.js';
-import { pageLines, Pager } from './pager.js';
-import { ANIMATED, Feed, Header, Label, Learning, queueOrder, Reports, TaskDetail, Tasks, Workers } from './parts.js';
+import { DepTree, Graph, Ideas, Timeline } from './graph.js';
+import { Pager, pagerLength, patchSummary, wrapText } from './pager.js';
+import { ask } from '../ask.js';
+import { issueGoal } from '../issue.js';
+import { History, Stats } from './stats.js';
+import { ANIMATED, Feed, Found, Header, Label, Learning, queueOrder, Reports, Review, TaskDetail, Tasks, Workers, type ReviewRow } from './parts.js';
 import { elapsed, type View } from './style.js';
+import { undo, undoRun } from '../worktree.js';
+import { recordIntent } from '../intent.js';
 
 type Tone = 'info' | 'ok' | 'warn' | 'danger';
 
@@ -27,8 +32,10 @@ export interface Command {
 export const COMMANDS: Command[] = [
 	{ name: 'run', args: '<goal>', desc: 'plan a goal into tasks and work them here (plain text does the same)' },
 	{ name: 'brainstorm', args: '<goal>', desc: 'explore ideas from several angles and agents first, then plan and work them' },
+	{ name: 'plan', args: '<goal>', desc: 'plan a goal into the queue and stop: see its tasks, tree and estimate, change them, then /work runs them' },
 	{ name: 'improve', args: '[focus]', desc: 'find and make the most valuable improvements to this project (brainstormed first)' },
 	{ name: 'work', desc: "work this project's open tasks, no planning" },
+	{ name: 'issue', args: '<n>', desc: 'plan and work GitHub issue n of this repository (read with gh; nothing is posted back)' },
 	{ name: 'queue', desc: "list the goals waiting for this project's run to end" },
 	{ name: 'unqueue', args: '<n>', desc: 'take queued goal n off the queue' },
 	{ name: 'open', args: '[project]', desc: "open a project's run dashboard" },
@@ -41,14 +48,22 @@ export const COMMANDS: Command[] = [
 	{ name: 'route', args: '[role|TYPE|default] [routes…|-]', desc: 'show the routing table, or set the agents a role or task type uses from the next run (this session only)' },
 	{ name: 'report', desc: "write the selected run's report (every task's outcome) and show where" },
 	{ name: 'reports', desc: "list this project's past run reports, newest first" },
+	{ name: 'ask', args: '<question>', desc: "ask about this project's runs, tasks or code: a read-only agent answers from jarvis-code's record" },
+	{ name: 'review', desc: 'triage every task that needs you: why, the next step, its patch; ↑↓ pick, Enter its patch, /task acts on it' },
+	{ name: 'find', args: '<text>', desc: "every task in this project that mentions the text, or whose patch touched a matching file" },
+	{ name: 'history', desc: "show or hide this project's finished runs: cost and success over time, and each run's tasks" },
 	{ name: 'graph', desc: "show or hide the run's planning pipeline and every agent run in it" },
 	{ name: 'tree', desc: "show or hide the run's tasks laid out by what they depend on" },
+	{ name: 'timeline', desc: 'show or hide every agent run in the run as bars on one time axis' },
+	{ name: 'ideas', desc: "show or hide the run's brainstorm: categories and the ideas grown under them, with their scores" },
 	{ name: 'runs', desc: 'list runs in this session' },
 	{ name: 'stop', args: '[all]', desc: "stop this project's run (or every run)" },
 	{ name: 'detach', desc: "hand this project's run to the background: it keeps going after you quit" },
 	{ name: 'pause', desc: 'pause or resume the run: running tasks finish, no new ones start' },
+	{ name: 'stats', desc: "show or hide the run's charts: tasks by status, cost by role and route, route scores, activity over time" },
 	{ name: 'demo', desc: 'a simulated run: see the reactor, learning and re-upgrades' },
 	{ name: 'diff', args: '[task]', desc: "page through a task's last patch (the selected or open task by default)" },
+	{ name: 'undo', args: '[task|run]', desc: "take a landed task's changes back out of the tree and defer it (the selected or open task by default); run: every task the newest run landed, newest first" },
 	{ name: 'diffs', desc: 'show or hide file changes in the feed' },
 	{ name: 'tools', desc: 'show or hide tool calls in the feed' },
 	{ name: 'messages', desc: 'show or hide agent messages in the feed' },
@@ -57,6 +72,9 @@ export const COMMANDS: Command[] = [
 	{ name: 'help', desc: 'what every command does' },
 	{ name: 'quit', desc: 'stop every run and exit' },
 ];
+
+/** A run's views in Tab order: its queue and agents, then each pane that takes the body. */
+const PANES = [undefined, 'graph', 'tree', 'timeline', 'stats', 'ideas'] as const;
 
 /** Verbs `/task` accepts, for Tab completion. */
 export const TASK_VERBS = ['add', 'show', 'bump', ...Object.keys(DECISIONS)];
@@ -241,7 +259,7 @@ function Help({ height }: { height: number }) {
 					</Box>
 				))}
 			</Box>
-			{fits && <Text color={c.textFaint}>↑↓ select a project (in a run: pick a task, Enter opens its detail) · Enter open · PgUp/PgDn/End activity · Tab complete · Esc back · Ctrl+C quit</Text>}
+			{fits && <Text color={c.textFaint}>↑↓ select a project (in a run: pick a task, Enter opens its detail) · Enter open · PgUp/PgDn/End activity · Tab complete (empty, in a run: next view) · Esc back · Ctrl+C quit</Text>}
 		</Box>
 	);
 }
@@ -291,14 +309,24 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 	// The task the cursor is on in a run's queue; cleared whenever the view changes.
 	const [selTask, setSelTask] = useState<string | undefined>();
 	useEffect(() => setSelTask(undefined), [view]);
-	// A pane that takes the whole body in a run view (/graph, /tree); cleared whenever the view changes.
-	const [pane, setPane] = useState<'graph' | 'tree' | 'diff'>();
+	// A pane that takes the whole body in a run view (/graph, /tree, /timeline, /stats); cleared whenever the view changes.
+	const [pane, setPane] = useState<'graph' | 'tree' | 'timeline' | 'stats' | 'ideas' | 'diff'>();
 	useEffect(() => setPane(undefined), [view]);
+	// The first row /ideas shows; PgUp/PgDn move it, and it starts at the top each time the pane opens.
+	const [ideasTop, setIdeasTop] = useState(0);
+	useEffect(() => setIdeasTop(0), [pane]);
 	// /reports opens the reports pane for the selected project's run store; Esc closes it.
 	// Read once when it opens: the cockpit renders at its fps while animating.
 	const [reports, setReports] = useState<ReturnType<Store['reports']>>();
+	// /history: the project's finished runs, read the same way.
+	const [pastRuns, setPastRuns] = useState<RunRecord[]>();
+	// /review: what needs you in this project and the picked row; read when it opens and after each /task.
+	const [review, setReview] = useState<{ rows: ReviewRow[]; at: number }>();
+	// /find: what it looked for and the tasks that matched, read when the command runs.
+	const [found, setFound] = useState<{ text: string; rows: ReturnType<Store['find']> }>();
 	// /diff's patch, read once when the command runs; `top` is the first line the pager shows.
-	const [diff, setDiff] = useState<{ id: string; text: string; top: number }>();
+	// /ask's answer opens in the same pager: `plain` prose, under its own title.
+	const [diff, setDiff] = useState<{ id: string; text: string; top: number; title?: string; plain?: boolean }>();
 	const [v, setV] = useState<View>({ ...config.ui, learning: false });
 	// Keys can arrive faster than React re-renders (fast typing, a paste split into chunks):
 	// handlers read the ref, so each key builds on the last instead of a stale render.
@@ -328,7 +356,12 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 	const selected = shown[selIndex];
 	const run: Run | undefined = typeof view === 'number' ? manager.runs.get(view) : undefined;
 	const here = run?.dir ?? selected?.path ?? cwd;
-	useEffect(() => setReports(undefined), [here]);
+	useEffect(() => {
+		setReports(undefined);
+		setPastRuns(undefined);
+		setFound(undefined);
+		setReview(undefined);
+	}, [here]);
 	// The project's queued goals, reread only where they change: never on 'update' or in render,
 	// which run many times a second.
 	const [goals, setGoals] = useState<QueuedGoal[]>([]);
@@ -345,6 +378,22 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 	const inspectTask = loaded?.id === inspect ? loaded : undefined;
 	// Bumped after /task and /tell write, so the open task is read again.
 	const [taskRev, setTaskRev] = useState(0);
+	/** Every task needing you here, with its next step and what its newest kept patch touched (file reads: commands only). */
+	const readReview = (): ReviewRow[] =>
+		(Store.open(here)?.tasks() ?? [])
+			.filter((t) => t.status === 'blocked' || t.status === 'review')
+			.map((t) => {
+				const file = t.attempts.findLast((a) => a.patch)?.patch;
+				let patch: string | undefined;
+				try {
+					patch = file ? patchSummary(readFileSync(file, 'utf8')) : undefined;
+				} catch {
+					/* the kept file is gone */
+				}
+				return { task: t, next: nextStep(t), patch };
+			});
+	// A decision took a task off the list (or changed it): read it again, keeping the cursor in range.
+	useEffect(() => setReview((r) => r && ((rows) => ({ rows, at: Math.min(r.at, Math.max(0, rows.length - 1)) }))(readReview())), [taskRev]);
 
 	const states = useMemo(() => new StateCache(), []);
 	useEffect(() => {
@@ -395,12 +444,15 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 	const say = (text: string, tone: Tone = 'info') => setMsg({ text, tone });
 	const select = (p: Project) => setSelPath(p.path);
 
-	/** `improve`: start the improve loop instead, unless the project is busy (then the goal queues). */
-	const startRun = async (dir: string, goal?: string, overrides?: unknown, improve?: { focus?: string }) => {
+	/** `improve`: start the improve loop instead, unless the project is busy (then the goal queues). `planOnly`: plan it and stop. */
+	const startRun = async (dir: string, goal?: string, overrides?: unknown, improve?: { focus?: string }, planOnly = false) => {
 		try {
 			const routes = { routes: routeOver };
-			const { run: r, queued }: { run?: Run; queued?: number } =
-				improve && !manager.busy(dir) ? { run: await manager.improve(dir, { ...config.improve, ...improve, overrides: routes }) } : await manager.submit(dir, { goal, overrides: merge(routes, overrides) });
+			const { run: r, queued }: { run?: Run; queued?: number } = planOnly
+				? { run: await manager.start(dir, { goal, planOnly, overrides: merge(routes, overrides) }) }
+				: improve && !manager.busy(dir)
+					? { run: await manager.improve(dir, { ...config.improve, ...improve, overrides: routes }) }
+					: await manager.submit(dir, { goal, overrides: merge(routes, overrides) });
 			if (!r) {
 				readGoals();
 				// A queued goal is only its text: /brainstorm's and /improve's deep planning is not kept with it.
@@ -412,7 +464,7 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 			setSelPath(r.dir);
 			setView(r.id);
 			if (r.warnings?.length) say(`run #${r.id} started, but ${r.warnings.join('; ')}`, 'warn');
-			else say(goal ? `run #${r.id} started in ${r.name}` : `working the ${r.name} queue (run #${r.id})`, 'ok');
+			else say(planOnly ? `planning in ${r.name} (run #${r.id}): nothing is worked until /work` : goal ? `run #${r.id} started in ${r.name}` : `working the ${r.name} queue (run #${r.id})`, 'ok');
 		} catch (e) {
 			say((e as Error).message, 'danger');
 		}
@@ -436,10 +488,21 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 			case 'brainstorm':
 				if (!arg) return say('/brainstorm needs a goal', 'warn');
 				return void startRun(here, arg, { planning: { mode: 'deep' } });
+			case 'plan':
+				if (!arg) return say('/plan needs a goal', 'warn');
+				// Not queued like a goal: the run it waited for would work the plan it was meant to show.
+				if (manager.busy(here)) return say(`${basename(here)} has a run going: /plan once it ends`, 'warn');
+				return void startRun(here, arg, undefined, undefined, true);
 			case 'improve':
 				return void startRun(here, improveGoal(arg || undefined), { planning: { mode: 'deep' } }, { focus: arg || undefined });
 			case 'work':
 				return void startRun(here);
+			case 'issue':
+				if (!arg) return say('/issue <n>: a GitHub issue of this repository, read with gh', 'warn');
+				say(`reading issue ${arg}…`);
+				return void issueGoal(here, arg)
+					.then((goal) => startRun(here, goal))
+					.catch((e: Error) => say(e.message, 'danger'));
 			case 'queue': {
 				const q = manager.queued(here);
 				setGoals(q);
@@ -533,7 +596,7 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 					}
 					if (!(verb in DECISIONS)) return say('/task add <title> · /task show <id> · /task retry|defer|drop|approve|bump [id] [why]', 'warn');
 					const hasTarget = /^T-\d+$/i.test(words[0] ?? '') || (BULK as readonly string[]).includes((words[0] ?? '').toLowerCase());
-					const target = hasTarget ? words[0] : inspect;
+					const target = hasTarget ? words[0] : (review?.rows[review.at]?.task.id ?? inspect);
 					if (!target) return say('/task retry|defer|drop|approve [id] [why]: no task open to act on', 'warn');
 					const project = Store.open(here);
 					if (!project) return say(`${basename(here)} has no tasks yet`, 'warn');
@@ -577,13 +640,23 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 				return say(`report: ${path}`, 'ok');
 			}
 			case 'graph':
-			case 'tree': {
+			case 'tree':
+			case 'timeline':
+			case 'stats':
+			case 'ideas': {
 				if (!run) return say(`/${cmd.name}: open a run first (Enter on a project with one, or type a goal)`, 'warn');
 				const want = cmd.name;
 				return setPane((p) => (p === want ? undefined : want));
 			}
 			case 'reports':
 				return setReports((r) => (r ? undefined : (Store.open(here)?.reports() ?? [])));
+			case 'history':
+				return setPastRuns((h) => (h ? undefined : (Store.open(here)?.history() ?? [])));
+			case 'review':
+				return setReview((r) => (r ? undefined : { rows: readReview(), at: 0 }));
+			case 'find':
+				if (!arg) return say('/find <text>: a word, a file name, part of a title', 'warn');
+				return setFound({ text: arg, rows: Store.open(here)?.find(arg) ?? [] });
 			case 'runs': {
 				const list = manager.list();
 				if (!list.length) return say('no runs yet in this session');
@@ -622,6 +695,25 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 				if (!current || current.finished) return say('nothing running here', 'warn');
 				current.o.togglePause();
 				return say(current.o.paused ? 'paused: running tasks finish, no new ones start' : 'resumed');
+			case 'ask': {
+				if (!arg) return say("/ask <question>: about this project's runs, tasks or code", 'warn');
+				let cfg: Config;
+				try {
+					// The project's own config (its agents), with this session's /route changes, as a run gets.
+					cfg = loadConfig(here, { routes: routeOver }).config;
+				} catch (e) {
+					return say((e as Error).message, 'danger');
+				}
+				say(`asking about ${basename(here)}…`);
+				void ask(cfg, manager.learning, here, arg)
+					.then(({ answer, route, cost }) => {
+						setDiff({ id: 'answer', text: wrapText(`Q: ${arg}\n\n${answer}`, columns - 8), top: 0, title: 'answer', plain: true });
+						setPane('diff');
+						say(`answered by ${route}${cost ? ` · $${cost.toFixed(2)}` : ''}`, 'ok');
+					})
+					.catch((e: Error) => say(e.message, 'danger'));
+				return;
+			}
 			case 'diff': {
 				const id = (arg || selTask || inspect || '').toUpperCase();
 				if (!id) return say('/diff [task]: pick a task (↑↓ in a run) or name one', 'warn');
@@ -638,6 +730,22 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 				if (!text) return say(`no patch for ${id}: no attempt of it changed files yet`, 'warn');
 				setDiff({ id, text, top: 0 });
 				return setPane('diff');
+			}
+			case 'undo': {
+				const id = (arg || selTask || inspect || '').toUpperCase();
+				if (!id) return say('/undo [task|run]: pick a task (↑↓ in a run), name one, or run for the newest run', 'warn');
+				const project = Store.open(here);
+				if (!project) return say(`${basename(here)} has no tasks yet`, 'warn');
+				const teach = { learning: manager.learning, ...(config.intent && { intent: recordIntent }) };
+				say(id === 'RUN' ? 'taking the newest run back out…' : `taking ${id}'s changes back out…`);
+				void (id === 'RUN' ? undoRun(project, here, teach) : undo(project, here, id, teach))
+					.then((m) => say(m, 'ok'))
+					.catch((e: Error) => say(e.message, 'danger'))
+					.finally(() => {
+						states.invalidate(here);
+						setTaskRev((n) => n + 1);
+					});
+				return;
 			}
 			case 'diffs':
 				return setV({ ...v, showDiffs: !v.showDiffs });
@@ -660,6 +768,9 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 		setInput('');
 		setMsg(undefined);
 		if (!line) {
+			// In /review, Enter pages the picked task's patch; Esc comes back to the list.
+			const picked = review?.rows[review.at]?.task.id;
+			if (picked) return command(`/diff ${picked}`);
 			if (run && selTask) {
 				if (run.demo) return say('a /demo run keeps its queue in memory: there is no stored task detail');
 				return setInspect(selTask);
@@ -690,7 +801,7 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 			return say(`${manager.active().length} run(s) going: Ctrl+C again to stop them and quit`, 'warn');
 		}
 		if (key.return) return submit();
-		if (key.escape) return input ? setInput('') : pane ? setPane(undefined) : inspect ? setInspect(undefined) : reports ? setReports(undefined) : setView('home');
+		if (key.escape) return input ? setInput('') : pane ? setPane(undefined) : review ? setReview(undefined) : inspect ? setInspect(undefined) : found ? setFound(undefined) : run && selTask ? setSelTask(undefined) : pastRuns ? setPastRuns(undefined) : reports ? setReports(undefined) : setView('home');
 		if (key.backspace || key.delete) return setInput(input.slice(0, -1));
 		if (key.ctrl && ch === 'u') return setInput('');
 		if (key.ctrl && ch === 'p') {
@@ -704,6 +815,11 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 			return setInput(histPos.current < history.current.length ? history.current[histPos.current] : '');
 		}
 		if (key.tab) {
+			// An empty prompt in a run: Tab and Shift+Tab walk its views (a /diff counts as the first).
+			if (!input && run) {
+				const at = Math.max(0, PANES.indexOf(pane as (typeof PANES)[number]));
+				return setPane(PANES[(at + (key.shift ? -1 : 1) + PANES.length) % PANES.length]);
+			}
 			const tm = input.match(/^\/task (\w*)$/);
 			const verb = tm && TASK_VERBS.find((v) => v.startsWith(tm[1]));
 			if (verb) return setInput(`/task ${verb} `);
@@ -713,10 +829,18 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 		}
 		if (pane === 'diff' && (key.pageUp || key.pageDown)) {
 			const rows = Math.max(1, body - 1);
-			return setDiff((d) => d && { ...d, top: Math.max(0, Math.min(pageLines(d.text).length - rows, d.top + (key.pageUp ? -1 : 1) * Math.max(1, rows - 1))) });
+			return setDiff((d) => d && { ...d, top: Math.max(0, Math.min(pagerLength(d.text, d.plain) - rows, d.top + (key.pageUp ? -1 : 1) * Math.max(1, rows - 1))) });
+		}
+		if (pane === 'ideas' && (key.pageUp || key.pageDown)) {
+			// One row per idea, plus a heading per lens for a flat brainstorm; never past the last page.
+			const ideas = snap.ideas ?? [];
+			const rowCount = ideas.length + (ideas.some((i) => i.id) ? 0 : new Set(ideas.map((i) => i.lens)).size);
+			return setIdeasTop((n) => Math.max(0, Math.min(rowCount - (body - 1), n + (key.pageUp ? -1 : 1) * Math.max(1, body - 2))));
 		}
 		if (key.pageUp || key.pageDown) return setBack((b) => Math.max(0, Math.min(2000, b + (key.pageUp ? 1 : -1) * Math.max(1, feedRows - 2))));
 		if (key.end) return setBack(0);
+		if ((key.upArrow || key.downArrow) && !input && review && !pane)
+			return setReview((r) => r && { ...r, at: Math.max(0, Math.min(r.rows.length - 1, r.at + (key.upArrow ? -1 : 1))) });
 		if ((key.upArrow || key.downArrow) && !input && run) {
 			const q = queueOrder(snap.tasks);
 			if (!q.length) return;
@@ -737,7 +861,8 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 	const headerRows = v.reactor === 'off' ? 6 : Math.max(reactorRows, 6);
 	const promptRows = 3 + Math.min(6, menu.length) + 1;
 	const free = Math.max(8, rows - headerRows - 2 - promptRows - 4);
-	const body = Math.max(4, Math.floor(free * 0.5));
+	// A pane over the run (graph, timeline, a diff…) is what you are reading: it takes most of the room from the feed.
+	const body = Math.max(4, Math.floor(free * ((run && pane) || review ? 0.75 : 0.5)));
 	const feedRows = Math.max(3, free - body);
 	const live = manager.active().length;
 	const needsYou = shown.reduce((n, p) => {
@@ -769,11 +894,19 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 				{view === 'help' ? (
 					<Help height={body} />
 				) : pane === 'diff' && diff ? (
-					<Pager text={diff.text} height={body - 1} top={diff.top} title={`diff ${diff.id}`} />
+					<Pager text={diff.text} height={body - 1} top={diff.top} title={diff.title ?? `diff ${diff.id}`} plain={diff.plain} />
+				) : review ? (
+					<Review rows={review.rows} at={review.at} height={body} />
 				) : run && pane === 'graph' ? (
 					<Graph snap={snap} height={body} icons={v.icons} />
 				) : run && pane === 'tree' ? (
 					<DepTree tasks={snap.tasks} height={body} icons={v.icons} />
+				) : run && pane === 'timeline' ? (
+					<Timeline snap={snap} height={body} width={columns - 6} />
+				) : run && pane === 'ideas' ? (
+					<Ideas ideas={snap.ideas} height={body} top={ideasTop} />
+				) : run && pane === 'stats' ? (
+					<Stats snap={snap} height={body} width={columns - 6} />
 				) : run ? (
 					<>
 						<Box width={inspectTask ? '30%' : '50%'} paddingRight={2}>
@@ -782,6 +915,10 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 						<Box width={inspectTask ? '70%' : '50%'}>
 							{inspectTask ? (
 								<TaskDetail task={inspectTask} height={body} />
+							) : found ? (
+								<Found text={found.text} found={found.rows} height={body} />
+							) : pastRuns ? (
+								<History runs={pastRuns} height={body} width={Math.floor((columns - 6) * 0.7)} />
 							) : reports ? (
 								<Reports reports={reports} height={body} />
 							) : v.learning ? (
@@ -802,6 +939,10 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 						<Box width={inspectTask ? '70%' : '58%'}>
 							{inspectTask ? (
 								<TaskDetail task={inspectTask} height={body} />
+							) : found ? (
+								<Found text={found.text} found={found.rows} height={body} />
+							) : pastRuns ? (
+								<History runs={pastRuns} height={body} width={Math.floor((columns - 6) * 0.7)} />
 							) : reports ? (
 								<Reports reports={reports} height={body} />
 							) : v.learning ? (
@@ -816,14 +957,14 @@ export function Cockpit({ manager, config, depth, focus, cwd, fast }: CockpitPro
 				)}
 			</Box>
 			<Box height={feedRows + 2} borderStyle="round" borderColor={c.tick} paddingX={1} overflow="hidden">
-				<Feed activity={feedItems} v={v} height={feedRows - 1} back={back} />
+				<Feed activity={feedItems} v={v} height={feedRows - 1} back={back} only={run ? selTask : undefined} />
 			</Box>
 			<Prompt input={input} placeholder={placeholder} menu={menu} />
 			<Box paddingX={1} justifyContent="space-between">
 				<Text color={tone} wrap="truncate-end">
 					{msg?.text ?? (run ? `run #${run.id} · ${next ? `next: ${next}` : run.dir}` : `${here}`)}
 				</Text>
-				<Text color={c.textFaint}>{inspectTask ? '/task retry [why] · approve · drop · bump · Esc close' : run ? 'Esc home · /stop · /pause · /help' : '↑↓ select · Enter open · /help'}</Text>
+				<Text color={c.textFaint}>{inspectTask ? '/task retry [why] · approve · drop · bump · Esc close' : run ? 'Tab views · Esc home · /stop · /help' : '↑↓ select · Enter open · /help'}</Text>
 			</Box>
 		</Box>
 	);

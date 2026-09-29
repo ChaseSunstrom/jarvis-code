@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { pathToFileURL } from 'node:url';
-import { install, installed, PLUGIN_DIR, uninstall } from '../src/plugin.js';
+import { install, installed, mcpInstalled, PLUGIN_DIR, uninstall } from '../src/plugin.js';
 
 const hook = join(PLUGIN_DIR, 'hooks', 'jc-hook.mjs');
 const runHook = (payload: object, env: Record<string, string>) =>
@@ -47,9 +47,13 @@ test('guard: task-state commands and nested runs are refused however the shell l
 		"j''arvis-code task drop T-1",
 		'jarvis\\-code work',
 		'sh -c \'jarvis-code "do more"\'',
+		'bash -c "jc plan more work"',
+		'bash -c "jc improve"',
+		'echo $(jc issue 4)',
+		'jarvis-code plan "more"',
 	])
 		assert.ok(refused(cmd), `not refused: ${JSON.stringify(cmd)}`);
-	for (const cmd of ['jarvis-code status', 'jarvis-code tasks --all', 'jc task show T-1', 'jc ls -la', 'dig example.com | jc --dig', 'npm test', 'git commit -m "fix jc task"', 'grep -r jarvis-code src', 'echo "jarvis-code is great"', 'git commit -m "teach jarvis-code tasks"'])
+	for (const cmd of ['jarvis-code status', 'jarvis-code tasks --all', 'jarvis-code history', 'jarvis-code find loader', 'jc task show T-1', 'jc ls -la', 'dig example.com | jc --dig', 'npm test', 'git commit -m "fix jc task"', 'grep -r jarvis-code src', 'echo "jarvis-code is great"', 'git commit -m "teach jarvis-code tasks"'])
 		assert.ok(!refused(cmd), `refused: ${JSON.stringify(cmd)}`);
 	assert.equal(refusal('Bash', { command: 'jarvis-code task drop T-1' }, {}), undefined, 'outside a run nothing is refused');
 });
@@ -101,5 +105,78 @@ test('opencode install links the plugin into the global plugins directory', () =
 	} finally {
 		if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
 		else process.env.XDG_CONFIG_HOME = prev;
+	}
+});
+
+test('mcp registration: codex gets one config.toml table, kept apart from theirs; uninstall removes only it', () => {
+	const home = mkdtempSync(join(tmpdir(), 'jc-codex-mcp-'));
+	process.env.CODEX_HOME = home;
+	try {
+		const file = join(home, 'config.toml');
+		const theirs = 'model = "gpt-6-sol"\n\n[mcp_servers.docs]\ncommand = "docs-server"\n';
+		writeFileSync(file, theirs);
+		assert.match(install('codex').join('\n'), /MCP server/);
+		install('codex'); // idempotent
+		const toml = readFileSync(file, 'utf8');
+		assert.equal(toml.match(/\[mcp_servers\.jarvis-code\]/g)?.length, 1);
+		assert.match(toml, /\[mcp_servers\.jarvis-code\]\ncommand = "jarvis-code"\nargs = \["mcp"\]\n/);
+		assert.ok(toml.startsWith(theirs), 'their settings untouched, ours appended');
+		assert.ok(mcpInstalled.codex());
+		uninstall('codex');
+		assert.equal(readFileSync(file, 'utf8'), theirs);
+		assert.equal(mcpInstalled.codex(), false);
+		// Theirs already names a jarvis-code server: left alone.
+		writeFileSync(file, '[mcp_servers.jarvis-code]\ncommand = "/opt/jc"\n');
+		assert.match(install('codex').join('\n'), /already has a jarvis-code MCP server/);
+		uninstall('codex');
+		assert.equal(readFileSync(file, 'utf8'), '[mcp_servers.jarvis-code]\ncommand = "/opt/jc"\n', 'not ours: kept');
+	} finally {
+		delete process.env.CODEX_HOME;
+	}
+});
+
+test('mcp registration: opencode gets an mcp entry in a plain-JSON opencode.json; JSONC is left for you', () => {
+	const xdg = mkdtempSync(join(tmpdir(), 'jc-oc-mcp-'));
+	const prev = process.env.XDG_CONFIG_HOME;
+	process.env.XDG_CONFIG_HOME = xdg;
+	try {
+		const file = join(xdg, 'opencode', 'opencode.json');
+		mkdirSync(join(xdg, 'opencode'), { recursive: true });
+		writeFileSync(file, JSON.stringify({ theme: 'dark', mcp: { docs: { type: 'local', command: ['docs'] } } }));
+		install('opencode');
+		const data = JSON.parse(readFileSync(file, 'utf8'));
+		assert.deepEqual(data.mcp['jarvis-code'], { type: 'local', command: ['jarvis-code', 'mcp'], enabled: true });
+		assert.equal(data.theme, 'dark');
+		assert.ok(data.mcp.docs, 'their servers stay');
+		assert.ok(mcpInstalled.opencode());
+		uninstall('opencode');
+		assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), { theme: 'dark', mcp: { docs: { type: 'local', command: ['docs'] } } });
+		writeFileSync(file, '{\n  // mine\n  "theme": "dark",\n}\n');
+		assert.match(install('opencode').join('\n'), /add this to .*opencode\.json.*"jarvis-code"/s, 'comments or trailing commas: not rewritten, the entry is printed');
+		assert.equal(readFileSync(file, 'utf8'), '{\n  // mine\n  "theme": "dark",\n}\n');
+		uninstall('opencode');
+	} finally {
+		if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+		else process.env.XDG_CONFIG_HOME = prev;
+	}
+});
+
+test('mcp registration: the Claude Code plugin ships the server in .mcp.json', () => {
+	const mcp = JSON.parse(readFileSync(join(PLUGIN_DIR, '.mcp.json'), 'utf8'));
+	assert.deepEqual(mcp.mcpServers['jarvis-code'], { command: 'jarvis-code', args: ['mcp'] });
+});
+
+test('mcp registration: a jarvis-code table of theirs written with spaces in its header is still seen, so no second table is appended', () => {
+	const home = mkdtempSync(join(tmpdir(), 'jc-codex-mcp2-'));
+	process.env.CODEX_HOME = home;
+	try {
+		const file = join(home, 'config.toml');
+		for (const header of ['[ mcp_servers . jarvis-code ]', '[mcp_servers."jarvis-code"]', 'mcp_servers.jarvis-code.command = "/opt/jc"']) {
+			writeFileSync(file, `${header}\ncommand = "/opt/jc"\n`);
+			assert.match(install('codex').join('\n'), /already has a jarvis-code MCP server of yours/, header);
+			assert.equal(readFileSync(file, 'utf8'), `${header}\ncommand = "/opt/jc"\n`);
+		}
+	} finally {
+		delete process.env.CODEX_HOME;
 	}
 });

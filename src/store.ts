@@ -63,6 +63,8 @@ export interface StoredTask {
 	brief?: string;
 	/** Paths the plan said the task will change or create; optional so older task files still load. */
 	files?: string[];
+	/** The worker route the planner picked for it. */
+	route?: string;
 	/** The goal the task was planned from. */
 	goal?: string;
 	source: 'user' | 'plan' | 'replan' | 'followup';
@@ -91,7 +93,30 @@ export interface NewTask {
 	brief?: string;
 	notes?: string;
 	files?: string[];
+	route?: string;
 }
+
+/** How one finished run went, for `history`: counts are of the run's tasks, `minutes` its length. */
+export interface RunRecord {
+	at: string;
+	minutes: number;
+	goal?: string;
+	total: number;
+	done: number;
+	blocked: number;
+	review: number;
+	cost: number;
+	planning: number;
+	/** Agent sessions the run started (planning and workers). */
+	agents: number;
+	stopped: boolean;
+	error?: string;
+	/** Tasks the run closed, in the order they landed: what undoing the run takes back. */
+	landed?: string[];
+}
+
+/** Run history lines a project keeps. */
+export const HISTORY_MAX = 500;
 
 /** A goal sent while the project's run was going, to run after it. */
 export interface QueuedGoal {
@@ -257,6 +282,7 @@ export class Project {
 				depends: (t.depends ?? []).map((d) => keys.get(d) ?? d).filter((d) => /^T-\d+$/.test(d)),
 				brief: t.brief ?? t.notes,
 				files: t.files,
+				...(t.route && { route: t.route }),
 				goal: opts.goal,
 				source: opts.source ?? 'user',
 				attempts: [],
@@ -413,6 +439,61 @@ export class Project {
 		const file = join(this.dir, 'research', `${name.replace(/[^\w.-]+/g, '-')}.md`);
 		writeAtomic(file, content);
 		return file;
+	}
+
+	/** One line about a finished run, appended; past HISTORY_MAX lines the oldest go. */
+	recordRun(r: RunRecord): void {
+		const file = join(this.dir, 'runs.jsonl');
+		appendFileSync(file, JSON.stringify(r) + '\n');
+		// ponytail: rewrites the whole file once it passes the cap; a few hundred short lines.
+		const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean);
+		if (lines.length > HISTORY_MAX) writeAtomic(file, lines.slice(-HISTORY_MAX).join('\n') + '\n');
+	}
+
+	/** Finished runs, newest first; a torn or foreign line is skipped. */
+	history(): RunRecord[] {
+		const file = join(this.dir, 'runs.jsonl');
+		if (!existsSync(file)) return [];
+		const out: RunRecord[] = [];
+		for (const l of readFileSync(file, 'utf8').split('\n')) {
+			try {
+				const r = JSON.parse(l) as RunRecord;
+				if (r && typeof r.at === 'string' && typeof r.total === 'number') out.push(r);
+			} catch {
+				/* a line cut short by a crash */
+			}
+		}
+		return out.reverse();
+	}
+
+	/**
+	 * Tasks that mention `text` (case-insensitive) in any field a person or agent wrote, or whose
+	 * kept patches touched a matching file, with where each matched. Reads the patch files: call it
+	 * from a command, never from render.
+	 */
+	find(text: string): { task: StoredTask; where: string[] }[] {
+		const q = text.trim().toLowerCase();
+		if (!q) return [];
+		const has = (s?: string) => !!s && s.toLowerCase().includes(q);
+		const out: { task: StoredTask; where: string[] }[] = [];
+		for (const t of this.tasks()) {
+			const where: string[] = [];
+			if (has(t.title)) where.push('title');
+			if (has(t.brief) || has(t.goal)) where.push('brief');
+			if (has(t.reason) || has(t.hint)) where.push('notes');
+			if (t.lessons.some(has)) where.push('lessons');
+			if (t.acs.some((a) => has(a.text) || has(a.verify))) where.push('criteria');
+			if (t.files?.some(has)) where.push('files');
+			if (t.attempts.some((a) => has(a.summary) || has(a.error))) where.push('attempts');
+			const touched = new Set<string>();
+			for (const a of t.attempts) {
+				if (!a.patch || !existsSync(a.patch)) continue;
+				for (const m of readFileSync(a.patch, 'utf8').matchAll(/^diff --git a\/\S+ b\/(\S+)$/gm)) if (has(m[1])) touched.add(m[1]);
+			}
+			for (const f of touched) where.push(`patch: ${f}`);
+			if (where.length) out.push({ task: t, where });
+		}
+		return out;
 	}
 
 	/** Past run reports, newest first. */

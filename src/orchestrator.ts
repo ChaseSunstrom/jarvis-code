@@ -7,12 +7,12 @@ import { agentEnabled, ROUTE_TYPES, type Config } from './config.js';
 import { decide } from './downgrade.js';
 import { choose, kindSummary, Learning, learnable, parseRoute, pick, routesFor, score, type Role, type Route } from './learn.js';
 import type { ReactorState } from './reactor.js';
-import { brainstormPrompt, coveragePrompt, critiquePrompt, different, ideasMarkdown, looksOpen, newIdeas, parseBrief, parseCoverage, parseIdeas, parseScores, planningContext, promptWriterPrompt, rank, type Brief, type Idea } from './pipeline.js';
+import { brainstormPrompt, branchPrompt, categoriesPrompt, coveragePrompt, critiquePrompt, different, ideasMarkdown, looksOpen, newIdeas, parseBrief, parseCoverage, parseIdeas, parseScores, planningContext, promptWriterPrompt, rank, type Brief, type Idea } from './pipeline.js';
 import { contextPack, defang, intakeText, parseIntake, validatePlan } from './context.js';
 import { diagnose, type Cause } from './diagnose.js';
 import { intentSummary, recordIntent } from './intent.js';
 import { codeExcerpts, failureExcerpts } from './excerpt.js';
-import { changes, git, needsReview, parseVerdict, reviewPrompt, snapshot } from './review.js';
+import { changes, git, guarded, needsReview, parseVerdict, reviewPrompt, snapshot } from './review.js';
 import { land, openWorktree, patchOf, unland } from './worktree.js';
 import { nextStep } from './store.js';
 import { shell, type Check, type PlannedTask, type Task, type TaskSource } from './tasks.js';
@@ -57,7 +57,12 @@ export interface WorkerView {
 	/** When `last` changed (a text or tool event). */
 	lastAt?: number;
 	cost: number;
+	/** When its latest text and tool events came (the newest PULSE_MAX), for its activity sparkline. */
+	beats?: number[];
 }
+
+/** Event times a worker keeps for its sparkline: a minute of a busy agent. */
+export const PULSE_MAX = 120;
 
 export type NodeRole = 'promptWriter' | 'brainstorm' | 'critic' | 'planner' | 'worker' | 'reviewer' | 'coverage';
 
@@ -119,6 +124,8 @@ export interface Snapshot {
 	routes: RouteView[];
 	/** What planning is doing now: writing the prompt, a brainstorm round, the critique, planning. */
 	stage?: string;
+	/** The run's brainstorm as it grows: a tree's categories and ideas (with ids and parents), or a flat brainstorm's ideas by lens; critic scores once ranked. */
+	ideas?: Idea[];
 	/** The goal's done items (the prompt writer's and the intake's DONE-WHEN lines), as the coverage check found them. */
 	clauses?: { text: string; state: 'open' | 'met' | 'unmet'; tasks: string[] }[];
 	error?: string;
@@ -195,7 +202,12 @@ export function workerContext(blocked: string[]): string {
 
 export const PLAN_MARKER = 'JARVIS-CODE PLAN';
 
-export function plannerPrompt(goal: string, cwd: string, context = ''): string {
+/** `routes`: the worker routes a task may be matched to; with two or more the planner may pick one per task. */
+export function plannerPrompt(goal: string, cwd: string, context = '', routes: string[] = []): string {
+	const pick =
+		routes.length > 1
+			? `\n- optionally "route": the worker that suits the task best, one of ${routes.map((r) => `"${r}"`).join(', ')}, going by what each is (a stronger model for risky or subtle work, a cheaper one for mechanical edits) and how each has done here; leave it out when any will do`
+			: '';
 	return `${PLAN_MARKER}
 You are the planner for jarvis-code, which works a task queue with coding agents.
 Goal: ${goal}
@@ -206,10 +218,10 @@ Read what you need to understand the repository (read-only: do not edit anything
 - 1-3 acceptance criteria, each with a non-interactive shell "verify" command, run from the repository root, that exits 0 only when the criterion holds (a test, a build, a grep)
 - concrete steps, and "notes" with what a worker needs (files, approach, pitfalls)
 - "files": paths the task will change or create (tests included), relative to the repository root; a step must say it creates any that do not exist yet
-- "depends": keys of earlier tasks it needs
+- "depends": keys of earlier tasks it needs${pick}
 
 Reply with ONLY a JSON object, no prose:
-{"tasks":[{"key":"t1","title":"...","type":"FEATURE","tier":"S","acs":[{"text":"...","verify":"..."}],"steps":["..."],"files":["..."],"depends":[],"notes":"..."}]}`;
+{"tasks":[{"key":"t1","title":"...","type":"FEATURE","tier":"S","acs":[{"text":"...","verify":"..."}],"steps":["..."],"files":["..."],"depends":[],"notes":"..."${pick ? ',"route":"..."' : ''}}]}`;
 }
 
 /** guidance follows the diagnosed cause: bad-check/env/flaky ask for a fixed or replaced verify command
@@ -405,6 +417,8 @@ export class Orchestrator extends EventEmitter {
 	private regressions: { cmd: string; task: string; title: string }[] = [];
 	/** The last attempt's diff per task, for viewing while the run is up; the oldest go past 100. */
 	private patches = new Map<string, string>();
+	/** The brainstorm tree so far (categories included), for viewing. */
+	private ideaTree: Idea[] = [];
 	paused = false;
 
 	constructor(
@@ -412,7 +426,8 @@ export class Orchestrator extends EventEmitter {
 		private source: TaskSource,
 		public learning: Learning,
 		private cwd: string,
-		private opts: { pluginDir?: string } = {},
+		/** planOnly: plan the goal into the queue and stop; a later `work` runs the tasks. */
+		private opts: { pluginDir?: string; planOnly?: boolean } = {},
 	) {
 		super();
 	}
@@ -472,6 +487,7 @@ export class Orchestrator extends EventEmitter {
 			}),
 			stage: this.phase === 'planning' ? this.stage : undefined,
 			clauses: this.clauses.length ? this.clauses : undefined,
+			ideas: this.ideaTree.length ? this.ideaTree : undefined,
 			error: this.error,
 		};
 	}
@@ -578,15 +594,57 @@ export class Orchestrator extends EventEmitter {
 			for (const r of this.regressions) lines.push(`- ${r.task} ${r.title}: \`${r.cmd}\``);
 			lines.push('');
 		}
+		// What each task's agent runs (attempts, reviews, re-plans) cost and took, from the kept nodes.
+		const now = Date.now();
+		const took = (ms: number) => (ms < 60_000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms / 60_000)}m`);
+		const spend = (ns: AgentNode[]) => ({ cost: ns.reduce((s, n) => s + n.cost, 0), ms: ns.reduce((s, n) => s + (n.ended ?? now) - n.started, 0), runs: ns.length });
 		lines.push(
-			'| task | outcome | route | attempts | note |',
-			'|---|---|---|---|---|',
-			...tasks.map((t) => `| ${t.id} ${t.title.replace(/\|/g, '/')} | ${t.status} | ${t.route ?? ''} | ${t.attempts} | ${(t.note ?? '').replace(/\|/g, '/').replace(/\n/g, ' ').slice(0, 200)} |`),
+			'| task | outcome | route | attempts | cost | time | note |',
+			'|---|---|---|---|---|---|---|',
+			...tasks.map((t) => {
+				const s = spend(this.nodes.filter((n) => n.task === t.id));
+				return `| ${t.id} ${t.title.replace(/\|/g, '/')} | ${t.status} | ${t.route ?? ''} | ${t.attempts} | $${s.cost.toFixed(2)} | ${took(s.ms)} | ${(t.note ?? '').replace(/\|/g, '/').replace(/\n/g, ' ').slice(0, 200)} |`;
+			}),
 		);
+		if (this.nodes.length) {
+			const by = (key: (n: AgentNode) => string) =>
+				[...new Set(this.nodes.map(key))]
+					.map((k) => ({ k, ...spend(this.nodes.filter((n) => key(n) === k)) }))
+					.sort((a, b) => b.cost - a.cost)
+					.map((x) => `${x.k} $${x.cost.toFixed(2)} (${x.runs} run${x.runs === 1 ? '' : 's'}, ${took(x.ms)})`)
+					.join(' · ');
+			lines.push('', '## Spend', '', `$${this.cost().toFixed(2)} in all${this.planningSpent ? `, $${this.planningSpent.toFixed(2)} of it planning` : ''}${this.nodeCount > this.nodes.length ? ` (the breakdown covers the latest ${this.nodes.length} of ${this.nodeCount} agent runs)` : ''}.`, '', `- by role: ${by((n) => n.role)}`, `- by route: ${by((n) => n.route)}`);
+		}
 		const learned = this.activity.filter((a) => a.kind === 'learn' || (a.kind === 'info' && / found /.test(a.text))).map((a) => `- ${a.text}`);
 		if (learned.length) lines.push('', '## Learned and found', '', ...learned);
 		if (this.error) lines.push('', `Stopped: ${this.error}`);
 		return lines.join('\n') + '\n';
+	}
+
+	/** One line on how the run went, where the source keeps history (`jarvis-code history`, /history). */
+	private recordHistory() {
+		const tasks = [...this.tasks.values()].filter((t) => t.status !== 'split');
+		const n = (s: TaskStatus) => tasks.filter((t) => t.status === s).length;
+		try {
+			this.source.history?.({
+				at: new Date(this.started).toISOString(),
+				minutes: Math.round((Date.now() - this.started) / 6000) / 10,
+				...(this.goal && { goal: this.goal.slice(0, 300) }),
+				total: tasks.length,
+				done: n('done'),
+				blocked: n('blocked'),
+				review: n('review'),
+				cost: Math.round(this.cost() * 100) / 100,
+				planning: Math.round(this.planningSpent * 100) / 100,
+				agents: this.nodeCount,
+				stopped: this.phase === 'stopped',
+				...(this.error && { error: this.error.slice(0, 200) }),
+				...(this.closed.length && { landed: this.closed.map((t) => t.id) }),
+			});
+		} catch (e) {
+			// History is a convenience: a full disk must not turn a finished run into a failed one.
+			this.note('error', `Could not record the run in history: ${(e as Error).message}`);
+		}
 	}
 
 	/** Run the configured notify command with `message` as `$1` (never spliced into the command). */
@@ -629,8 +687,16 @@ export class Orchestrator extends EventEmitter {
 		try {
 			if (goal) {
 				this.goal = goal;
-				const { brief } = await this.plan(goal);
+				const { brief, ids } = await this.plan(goal);
 				this.clauses = [...new Set([...(brief?.done ?? []), ...(intake?.doneWhen ?? [])])].map((text) => ({ text, state: 'open', tasks: [] }));
+				if (this.opts.planOnly) {
+					if (this.stopped) return { done: 0, blocked: 0, review: 0 };
+					// Shown as the queue they join, so the task list and /tree show the plan before any of it runs.
+					for (const t of await this.source.next(new Set()))
+						if (ids.includes(t.id)) this.tasks.set(t.id, { id: t.id, title: t.title, type: t.type, tier: t.tier, status: 'queued', attempts: 0, depends: t.depends });
+					this.note('plan', `Plan only: ${ids.length} task${ids.length === 1 ? '' : 's'} queued, none started. /work (\`jarvis-code work\`) runs them; /task drop, defer or bump, and /tell, change them first`);
+					return { done: 0, blocked: 0, review: 0 };
+				}
 			}
 			if (!this.stopped) await this.work();
 			if (goal && this.clauses.length && this.config.planning.coverage && !this.stopped) await this.coverage(goal);
@@ -644,8 +710,12 @@ export class Orchestrator extends EventEmitter {
 			this.phase = this.stopped ? 'stopped' : 'finished';
 			this.learning.save();
 			this.changed();
-			this.saveReport();
-			await this.notify(this.digest());
+			// A plan with nothing worked is not a run to report, count in the history or ping about.
+			if (!this.opts.planOnly || this.error) {
+				this.saveReport();
+				this.recordHistory();
+				await this.notify(this.digest());
+			}
 		}
 		const count = (s: TaskStatus) => [...this.tasks.values()].filter((t) => t.status === s).length;
 		return { done: count('done'), blocked: count('blocked'), review: count('review') };
@@ -684,7 +754,7 @@ export class Orchestrator extends EventEmitter {
 				used.push(written.route);
 			}
 			const open = mode === 'deep' || (brief ? brief.kind === 'open' : looksOpen(goal));
-			if (open && !this.stopped) ideas = await this.brainstorm(goal, brief, intent);
+			if (open && !this.stopped) ideas = await (this.config.planning.brainstorm === 'tree' ? this.brainstormTree(goal, brief, intent) : this.brainstorm(goal, brief, intent));
 			if (ideas.length > 1 && this.config.planning.critique && !this.stopped) ideas = await this.critique(goal, brief, ideas, used);
 		}
 		const context = [facts, planningContext(brief, ideas)].filter(Boolean).join('\n\n');
@@ -696,7 +766,7 @@ export class Orchestrator extends EventEmitter {
 			const route = pick(order, this.learning, 'priority', failed) ?? pick(order, this.learning, 'priority');
 			if (!route) break;
 			const out = await this.launch('planner', { id: 'plan', title: goal }, route, 'planning', {
-				prompt: plannerPrompt(goal, this.cwd, context),
+				prompt: plannerPrompt(goal, this.cwd, context, this.routes('worker').map((r) => r.id)),
 				cwd: this.cwd,
 				model: route.model,
 				role: 'planner',
@@ -714,10 +784,20 @@ export class Orchestrator extends EventEmitter {
 				const safe = defang(plan);
 				plan = safe.plan;
 				if (safe.removed.length) this.note('error', `Removed ${safe.removed.length} verify command(s) jarvis-code will not run; those tasks will wait for your review`, { detail: safe.removed.join('\n') });
+				// A route pick is kept only when it names one of this run's worker routes: the planner's text never picks a binary.
+				const workers = new Set(this.routes('worker').map((r) => r.id));
+				const strays = [...new Set(plan.filter((t) => t.route !== undefined && !workers.has(t.route)).map((t) => String(t.route)))];
+				if (strays.length) {
+					plan = plan.map((t) => (t.route !== undefined && !workers.has(t.route) ? { ...t, route: undefined } : t));
+					this.note('info', `Ignored route picks that are not worker routes here: ${strays.join(', ').slice(0, 200)}`);
+				}
 				this.stage = undefined;
 				this.source.research?.(`plan-${stamp()}`, `# Plan: ${goal}\n\nBy ${route.id}${used.length ? ` from a prompt by ${used[0].id}` : ''}.\n\n${plan.map((t) => `- ${t.title}`).join('\n')}\n`);
 				const ids = await this.source.add(plan, goal);
-				this.note('plan', `Planned ${ids.length} task${ids.length === 1 ? '' : 's'} with ${route.id}`, { detail: plan.map((t, i) => `${ids[i]} ${t.title}`).join('\n') });
+				// What it will likely take, at this project's past pace per task (planning left out of the cost).
+				const pace = this.source.pace?.();
+				const guess = pace ? ` · about $${(pace.usd * ids.length).toFixed(2)} and ${Math.max(1, Math.round(pace.minutes * ids.length))} min at this project's pace (${pace.runs} run${pace.runs === 1 ? '' : 's'})` : '';
+				this.note('plan', `Planned ${ids.length} task${ids.length === 1 ? '' : 's'} with ${route.id}${guess}`, { detail: plan.map((t, i) => `${ids[i]} ${t.title}`).join('\n') });
 				return { brief, ids };
 			}
 			failed.add(route.id);
@@ -744,7 +824,7 @@ export class Orchestrator extends EventEmitter {
 	private async reask(goal: string, context: string, route: Route, plan: PlannedTask[], problems: string[]): Promise<PlannedTask[] | undefined> {
 		this.note('plan', `The plan from ${route.id} has ${problems.length} problem${problems.length === 1 ? '' : 's'}; asking it again`, { detail: problems.join('\n') });
 		const out = await this.launch('planner', { id: 'plan', title: goal }, route, 'planning', {
-			prompt: `${plannerPrompt(goal, this.cwd, context)}\n\nYour previous plan (below) has these problems. Fix them and reply with the whole plan again, JSON only:\n${problems.map((p) => `- ${p}`).join('\n')}\n\nPrevious plan:\n${JSON.stringify({ tasks: plan })}`,
+			prompt: `${plannerPrompt(goal, this.cwd, context, this.routes('worker').map((r) => r.id))}\n\nYour previous plan (below) has these problems. Fix them and reply with the whole plan again, JSON only:\n${problems.map((p) => `- ${p}`).join('\n')}\n\nPrevious plan:\n${JSON.stringify({ tasks: plan })}`,
 			cwd: this.cwd,
 			model: route.model,
 			role: 'planner',
@@ -797,6 +877,7 @@ export class Orchestrator extends EventEmitter {
 		const pool = this.routes('brainstorm').filter((r) => !this.learning.routeOff(r.id));
 		if (!pool.length || !lenses.length) return [];
 		const all: Idea[] = [];
+		this.ideaTree = all;
 		for (let round = 1; round <= rounds && !this.stopped; round++) {
 			this.stage = `brainstorm round ${round}/${rounds}`;
 			this.changed();
@@ -830,6 +911,88 @@ export class Orchestrator extends EventEmitter {
 		return all;
 	}
 
+	/**
+	 * Ideas as a tree: one session names the goal's categories, then each level grows every
+	 * category's branch in one session per category (the category itself at level 2, then the
+	 * best `breadth` new ideas of the level before, by their proposers' value). Categories rotate
+	 * across routes each level, so different agents grow each branch. Ends at `depth`, at
+	 * `maxCalls` sessions, or when a level adds nothing. Returns the ideas under the categories.
+	 */
+	private async brainstormTree(goal: string, brief: Brief | undefined, intent: string): Promise<Idea[]> {
+		const { parallel, lenses: base, tree } = this.config.planning;
+		const lenses = [...new Set([...base, ...(brief?.lenses ?? []).slice(0, 3)])];
+		const pool = this.routes('brainstorm').filter((r) => !this.learning.routeOff(r.id));
+		if (!pool.length) return [];
+		let calls = 0;
+		const ask = async (key: string, title: string, prompt: string, route: Route): Promise<Idea[]> => {
+			calls++;
+			const out = await this.launch(key, { id: `ideas:${key.slice('idea:'.length)}`, title }, route, 'planning', {
+				prompt,
+				cwd: this.cwd,
+				model: route.model,
+				role: 'planner',
+				blockedTools: this.learning.blockedTools(route.agent),
+				pluginDir: this.opts.pluginDir,
+				env: this.env(route, 'planner', 'ideas'),
+			});
+			const got = [out.summary, ...[...(out.results ?? [])].reverse()].map(parseIdeas).find(Boolean);
+			this.learnRoute(route, !!got);
+			return (got ?? []).map((i) => ({ ...i, route: route.id }));
+		};
+		this.stage = `brainstorm level 1/${tree.depth}: categories`;
+		this.changed();
+		const found = await ask('idea:categories', 'categories', categoriesPrompt(goal, brief?.brief ?? goal, tree.categories, lenses, intent), pool[0]);
+		// No usable categories: the lenses stand in, so the tree still grows.
+		const named = newIdeas([], found);
+		const cats = (named.length ? named : lenses.map((title): Idea => ({ title, route: pool[0].id })))
+			.slice(0, tree.categories)
+			.map((c, n): Idea => ({ ...c, id: String(n + 1), depth: 1, lens: c.title, round: 1 }));
+		const all: Idea[] = [...cats];
+		this.ideaTree = all;
+		this.note('plan', `Brainstorm tree: ${cats.length} categor${cats.length === 1 ? 'y' : 'ies'}`, { detail: cats.map((c) => c.title).join('\n') });
+		// What each category grows from next: the category itself, then its best new ideas.
+		const frontier = new Map(cats.map((c) => [c.id!, [c]]));
+		for (let level = 2; level <= tree.depth && !this.stopped && calls < tree.maxCalls; level++) {
+			this.stage = `brainstorm level ${level}/${tree.depth}`;
+			this.changed();
+			const growing = cats.filter((c) => frontier.get(c.id!)?.length);
+			let added = 0;
+			// Categories that got a session this level: maxCalls can run out partway through one.
+			let grew = 0;
+			for (let i = 0; i < growing.length && !this.stopped; i += parallel)
+				await Promise.all(
+					growing.slice(i, i + parallel).map(async (cat, j) => {
+						if (calls >= tree.maxCalls) return frontier.set(cat.id!, []);
+						grew++;
+						const parents = frontier.get(cat.id!)!;
+						const route = pool[(i + j + level - 1) % pool.length];
+						const inCat = all.filter((x) => x.lens === cat.title && x.depth! > 1);
+						const got = await ask(`idea:${cat.title}`, `${cat.title} · level ${level}`, branchPrompt(goal, brief?.brief ?? goal, cat.title, parents, level === 2 ? 5 : 4, inCat, level, tree.depth, intent), route);
+						// Level 2's one parent is the category; deeper, a reply must say which numbered idea it expands.
+						const placed = got.filter((g) => (parents.length === 1 && !g.of) || (g.of && g.of <= parents.length));
+						const fresh = newIdeas(all, placed);
+						const kids = new Map<string, number>();
+						const grown = fresh.map((g): Idea => {
+							const parent = parents[(g.of ?? 1) - 1];
+							const k = (kids.get(parent.id!) ?? all.filter((x) => x.parent === parent.id).length) + 1;
+							kids.set(parent.id!, k);
+							return { ...g, id: `${parent.id}.${k}`, parent: parent.id, depth: level, lens: cat.title, round: level, path: [...(parent.path ?? []), parent.title] };
+						});
+						all.push(...grown);
+						added += grown.length;
+						// Stable sort: equal values keep the order they were proposed in.
+						frontier.set(cat.id!, [...grown].sort((a, b) => (b.value ?? 0) - (a.value ?? 0)).slice(0, tree.breadth));
+					}),
+				);
+			this.note('plan', `Brainstorm level ${level}: ${added} new idea${added === 1 ? '' : 's'} across ${grew} categor${grew === 1 ? 'y' : 'ies'}`);
+			this.changed();
+			if (!added) break;
+		}
+		if (calls >= tree.maxCalls) this.note('info', `Brainstorm tree stopped at planning.tree.maxCalls (${tree.maxCalls} session${tree.maxCalls === 1 ? '' : 's'})`);
+		if (all.length) this.source.research?.(`brainstorm-${stamp()}`, ideasMarkdown(goal, all));
+		return all.filter((x) => x.depth! > 1);
+	}
+
 	/** The ideas ranked by a critic on a route unlike the prompt writer's; unranked when it gives no usable scores. */
 	private async critique(goal: string, brief: Brief | undefined, ideas: Idea[], used: Route[]): Promise<Idea[]> {
 		const route = pick(different(this.routes('critic'), used), this.learning, 'priority');
@@ -852,6 +1015,12 @@ export class Orchestrator extends EventEmitter {
 			return ideas;
 		}
 		const ranked = rank(ideas, scores);
+		// The brainstorm keeps its shape for viewing; its ideas take the critic's scores (titles are unique after merging).
+		const byTitle = new Map(ranked.map((r) => [r.title, r]));
+		for (const i of ideas) {
+			const r = byTitle.get(i.title);
+			if (r?.critique) Object.assign(i, { critique: r.critique, score: r.score });
+		}
 		this.source.research?.(`critique-${stamp()}`, ideasMarkdown(goal, ranked));
 		this.note('plan', `Critique by ${route.id}: ranked ${scores.length} of ${ideas.length} ideas`, { detail: ranked.map((i) => `${i.score ?? '-'} ${i.title}`).join('\n') });
 		return ranked;
@@ -998,7 +1167,9 @@ export class Orchestrator extends EventEmitter {
 		// only when they pass, and pass again there.
 		const isolate = this.config.maxParallel > 1 && this.config.worktrees;
 		for (let attempt = 1; attempt <= this.config.maxAttempts && !this.stopped; attempt++) {
-			const chosen = choose(routes, this.learning, this.config.strategy, failed, task) ?? choose(routes, this.learning, this.config.strategy, new Set(), task);
+			// The planner's pick for this task gets the first attempt while it is healthy; retries choose as usual.
+			const picked = !failed.size && task.route ? routes.find((r) => r.id === task.route && !this.learning.offFor(r.id, task.type)) : undefined;
+			const chosen = picked ? { route: picked, why: "the planner's pick for this task" } : (choose(routes, this.learning, this.config.strategy, failed, task) ?? choose(routes, this.learning, this.config.strategy, new Set(), task));
 			if (!chosen) break;
 			// A note told mid-run lands here, for the next attempt.
 			task.hint = this.source.hint?.(task.id) ?? task.hint;
@@ -1043,7 +1214,7 @@ export class Orchestrator extends EventEmitter {
 				}
 				const bad = checks.find((c) => !c.ok);
 				const checked = out.ok && !bad && !/^BLOCKED:/m.test(out.summary);
-				const findings = checked && needsReview(this.config.review, task) && before && !this.stopped ? await this.review(task, route, before, where) : undefined;
+				const findings = checked && this.config.review !== 'off' && before && !this.stopped ? await this.review(task, route, before, where) : undefined;
 				// What this attempt changed, taken once before the worktree goes: kept for viewing, and
 				// reused below. Quietly none outside a git repo (no `before`).
 				const after = before ? await snapshot(where, wt ? LINKS : []) : undefined;
@@ -1246,12 +1417,17 @@ export class Orchestrator extends EventEmitter {
 	/**
 	 * A second route's verdict on what one attempt changed (its diff only, not the worker's
 	 * account of it). Findings to retry with, or undefined to close: no repository, no change,
-	 * no verdict and approval all let the passing checks stand.
+	 * no verdict and approval all let the passing checks stand. A task the review mode skips is
+	 * still reviewed when its diff touches build, test or CI config: it could have passed by
+	 * weakening its own checks.
 	 */
 	private async review(task: Task, worker: Route, before: string, where = this.cwd): Promise<string[] | undefined> {
 		const after = await snapshot(where, where === this.cwd ? [] : LINKS);
 		const diff = after ? await changes(where, before, after) : '';
 		if (!diff.trim()) return undefined;
+		const guards = await guarded(where, before, after!);
+		if (!needsReview(this.config.review, task) && !guards.length) return undefined;
+		if (guards.length) this.note('info', `${task.id} changes ${guards.join(', ')}: reviewing it, since it could pass by weakening its own checks`, { task: task.id });
 		const pool = this.routes('reviewer');
 		// Never the worker's own route: with no other one there is no review, only the checks.
 		const route = pick(different(pool.filter((r) => r.id !== worker.id), [worker]), this.learning, 'priority');
@@ -1262,7 +1438,7 @@ export class Orchestrator extends EventEmitter {
 		const view = this.tasks.get(task.id);
 		if (view) view.status = 'verifying';
 		const out = await this.launch(`review:${task.id}`, { id: task.id, title: task.title }, route, 'reviewing', {
-			prompt: reviewPrompt(task, diff),
+			prompt: reviewPrompt(task, diff, { goal: this.goal, guards }),
 			cwd: this.cwd,
 			model: route.model,
 			role: 'planner',
@@ -1328,6 +1504,10 @@ export class Orchestrator extends EventEmitter {
 		let retryModel: string | undefined;
 		let upgrades = 0;
 		const tid = task.id;
+		const pulse = () => {
+			(w.beats ??= []).push(Date.now());
+			if (w.beats.length > PULSE_MAX) w.beats.splice(0, w.beats.length - PULSE_MAX);
+		};
 		const onEvent = (e: AgentEvent) => {
 			switch (e.type) {
 				case 'init':
@@ -1336,12 +1516,14 @@ export class Orchestrator extends EventEmitter {
 				case 'text':
 					w.last = node.last = messageLine(e.text);
 					w.lastAt = node.lastAt = Date.now();
+					pulse();
 					this.note('text', w.last, { task: tid, detail: e.text });
 					return;
 				case 'tool':
 					w.tools++;
 					w.last = node.last = e.summary;
 					w.lastAt = node.lastAt = Date.now();
+					pulse();
 					if (e.name.includes('(')) subagents.add(e.name);
 					this.note('tool', e.summary, { task: tid });
 					return;

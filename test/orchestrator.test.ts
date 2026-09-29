@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { DEFAULTS, merge, normalize, type Config } from '../src/config.js';
 import { Learning } from '../src/learn.js';
-import { DETAIL_MAX, messageLine, Orchestrator, parsePlan, roleOf, workerContext, workerNotes, type Snapshot } from '../src/orchestrator.js';
+import { DETAIL_MAX, messageLine, Orchestrator, parsePlan, plannerPrompt, roleOf, workerContext, workerNotes, type Snapshot } from '../src/orchestrator.js';
 import { fleet } from '../src/runs.js';
 import type { Run } from '../src/runs.js';
 import { brainstormPrompt, different, looksOpen, newIdeas, parseBrief, parseIdeas } from '../src/pipeline.js';
@@ -17,6 +17,7 @@ import { parseIntake, validatePlan } from '../src/context.js';
 import { Project } from '../src/store.js';
 import { MemorySource, StoreSource, type PlannedTask } from '../src/tasks.js';
 import { readIntent } from '../src/intent.js';
+import { ask } from '../src/ask.js';
 
 const demoAgent = fileURLToPath(new URL('../src/demo-agent.js', import.meta.url));
 const tmp = (p: string) => mkdtempSync(join(tmpdir(), `jc-${p}-`));
@@ -134,6 +135,24 @@ test('a check that fails the same way on two routes blocks without spending more
 	assert.deepEqual(await o.run('broken check'), { done: 0, blocked: 1, review: 0 });
 	assert.equal(o.snapshot().tasks[0].attempts, 2);
 	assert.match(source.tasks[0].reason ?? '', /same way on 2 routes/);
+});
+
+test('plan only: the tasks are planned into the store and listed, nothing is worked, reported or counted', async () => {
+	const cwd = tmp('store-repo');
+	const log = join(tmp('log'), 'prompts.jsonl');
+	const { config, learning } = setup({ workers: ['claude:claude-fable-5-1'], planning: { mode: 'direct' } }, plan(2), { JC_DEMO_LOG: log });
+	const project = new Project(cwd, tmp('store'));
+	const o = new Orchestrator(config, new StoreSource(project, cwd, 60), learning, cwd, { planOnly: true });
+	assert.deepEqual(await o.run('two things'), { done: 0, blocked: 0, review: 0 });
+	assert.deepEqual(project.tasks().map((t) => [t.id, t.status]), [['T-0001', 'planned'], ['T-0002', 'planned']]);
+	const s = o.snapshot();
+	assert.equal(s.phase, 'finished');
+	assert.deepEqual(s.tasks.map((t) => [t.id, t.status, t.depends]), [['T-0001', 'queued', []], ['T-0002', 'queued', ['T-0001']]]);
+	assert.ok(s.activity.some((a) => a.text.startsWith('Plan only: 2 tasks queued, none started. /work')), s.activity.map((a) => a.text).join('\n'));
+	assert.ok(!readFileSync(log, 'utf8').includes('Task T-0001'), 'no worker ran');
+	assert.ok(!existsSync(join(cwd, 'out')), 'nothing was written');
+	assert.deepEqual(project.history(), [], 'not a run in the history');
+	assert.deepEqual(project.reports(), [], 'no report');
 });
 
 test('diagnosis: a check that cannot run stops attempts and is recorded with its cause', async () => {
@@ -450,7 +469,8 @@ function pipelineSetup(env: Record<string, string>, planning: object, over: obje
 			agents: { local: { models: ['qwen3-coder'], env: agentEnv } },
 			planner: ['claude:claude-fable-5-1', 'local:qwen3-coder'],
 			workers: ['claude:claude-fable-5-1'],
-			planning,
+			// These tests exercise the flat lens × rounds brainstorm unless they ask for the tree.
+			planning: { brainstorm: 'flat', ...planning },
 			...over,
 		},
 		plan(1),
@@ -490,6 +510,122 @@ test('pipeline: a vague goal is prompted, brainstormed by several agents in roun
 	const log = readFileSync(promptLog, 'utf8');
 	assert.match(log, /"JARVIS-CODE IDEAS/);
 	assert.doesNotMatch(log, /\[no tools\]/, 'the prompt writer, brainstormers and planner all read the repository');
+});
+
+test('tree brainstorm: categories, then each level grows the best ideas of each category on rotating routes; the planner sees their paths', async () => {
+	const promptLog = join(tmp('log'), 'prompts.jsonl');
+	const { o, project, notes } = pipelineSetup({ JC_DEMO_LOG: promptLog, JC_DEMO_KIND: 'open' }, { brainstorm: 'tree', tree: { depth: 3, categories: 2, breadth: 2, maxCalls: 24 } });
+	const stages = new Set<string>();
+	o.on('update', () => {
+		const st = o.snapshot().stage;
+		if (st) stages.add(st);
+	});
+	assert.deepEqual(await o.run('improve the settings'), { done: 1, blocked: 0, review: 0 });
+	const n = notes();
+	assert.ok(n.includes('Brainstorm tree: 2 categories'), 'three named, capped at planning.tree.categories');
+	assert.ok(n.includes('Brainstorm level 2: 6 new ideas across 2 categories'), '3 broad ideas per category');
+	assert.ok(n.includes('Brainstorm level 3: 8 new ideas across 2 categories'), 'the best 2 of each category, 2 more each');
+	assert.ok(['brainstorm level 1/3: categories', 'brainstorm level 2/3', 'brainstorm level 3/3'].every((s) => stages.has(s)), [...stages].join(', '));
+	const prompts: string[] = readFileSync(promptLog, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+	assert.equal(prompts.filter((p) => p.startsWith('JARVIS-CODE CATEGORIES')).length, 1);
+	const branches = prompts.filter((p) => p.startsWith('JARVIS-CODE BRANCH'));
+	assert.equal(branches.length, 4, 'one session per category per level');
+	const deep = branches.find((p) => /Category: Interface\. Level 3 of 3\./.test(p))!;
+	assert.match(deep, /^1\. Interface amber: /m, 'the highest-valued idea is expanded');
+	assert.match(deep, /^2\. Interface cobalt: /m);
+	assert.doesNotMatch(deep, /^3\. /m, 'only the best planning.tree.breadth');
+	assert.match(deep, /^- Interface crimson$/m, 'the rest of the category is shown, to go past');
+	const planner = prompts.find((p) => p.startsWith('JARVIS-CODE PLAN'))!;
+	assert.match(planner, /a brainstorm tree of 2 categories/);
+	assert.match(planner, /- Interface alpha .*\(Interface › Interface amber\)/, 'a level-3 idea carries its path');
+	const files = readdirSync(join(project.dir, 'research'));
+	const md = readFileSync(join(project.dir, 'research', files.find((f) => f.startsWith('brainstorm-'))!), 'utf8');
+	assert.match(md, /^- \*\*Interface\*\* \(level 1/m);
+	assert.match(md, /^  - \*\*Interface amber\*\* \(level 2/m);
+	assert.match(md, /^    - \*\*Interface alpha\*\* \(level 3/m);
+	assert.match(md, /claude:claude-fable-5-1/);
+	assert.match(md, /local:qwen3-coder/, 'the categories were grown on different routes');
+});
+
+test('tree brainstorm: it stops at maxCalls, and falls back to the lenses when no categories come back', async () => {
+	const capped = pipelineSetup({ JC_DEMO_KIND: 'open' }, { brainstorm: 'tree', tree: { depth: 4, categories: 3, breadth: 2, maxCalls: 2 } });
+	await capped.o.run('improve the settings');
+	assert.ok(capped.notes().includes('Brainstorm tree stopped at planning.tree.maxCalls (2 sessions)'));
+	assert.ok(capped.notes().includes('Brainstorm level 2: 3 new ideas across 1 category'), 'the one session left grew one category, and the note counts only it');
+	const broken = pipelineSetup({ JC_DEMO_KIND: 'open', JC_DEMO_BREAK: 'ideas' }, { brainstorm: 'tree', lenses: ['speed', 'safety'], tree: { depth: 2, categories: 6, breadth: 1, maxCalls: 24 } });
+	await broken.o.run('improve the settings');
+	assert.ok(broken.notes().some((t) => /^Brainstorm tree: \d+ categories$/.test(t) && !t.startsWith('Brainstorm tree: 0')), 'the lenses stood in');
+	assert.ok(broken.notes().includes('Brainstorm level 2: 0 new ideas across 3 categories'), 'speed, safety and the prompt writer\'s angle; replies unusable');
+});
+
+test('idea tree: the snapshot carries the brainstorm, categories included, with the critic\'s scores; a flat one keeps its lenses', async () => {
+	const tree = pipelineSetup({ JC_DEMO_KIND: 'open' }, { brainstorm: 'tree', tree: { depth: 3, categories: 2, breadth: 1, maxCalls: 24 } });
+	await tree.o.run('improve the settings');
+	const ideas = tree.o.snapshot().ideas!;
+	assert.deepEqual(ideas.filter((i) => i.depth === 1).map((i) => i.title), ['Interface', 'Reliability']);
+	const deep = ideas.find((i) => i.id === '1.1.1')!;
+	assert.equal(deep.parent, '1.1');
+	assert.deepEqual(deep.path, ['Interface', 'Interface amber']);
+	assert.ok(ideas.filter((i) => i.depth! > 1).every((i) => i.critique && typeof i.score === 'number'), 'every idea under a category was scored');
+	assert.ok(ideas.filter((i) => i.depth === 1).every((i) => !i.critique), 'categories are not scored');
+
+	const flat = pipelineSetup({ JC_DEMO_KIND: 'open' }, { lenses: ['reliability'], rounds: 1 });
+	await flat.o.run('improve the settings');
+	const f = flat.o.snapshot().ideas!;
+	assert.ok(f.length && f.every((i) => i.lens && !i.id), 'flat ideas by lens, no tree ids');
+});
+
+test('history: a finished run records its goal, counts, cost and agent sessions in the store', async () => {
+	const { o, project } = pipelineSetup({}, {}, { planning: { mode: 'direct' } });
+	await o.run('add the loader');
+	const [r] = project.history();
+	assert.equal(r.goal, 'add the loader');
+	assert.deepEqual([r.total, r.done, r.blocked, r.review, r.stopped], [1, 1, 0, 0, false]);
+	assert.ok(r.agents >= 2, 'the planner and the worker at least');
+	assert.ok(r.cost >= r.planning && typeof r.minutes === 'number');
+	assert.deepEqual(r.landed, ['T-0001'], 'what undoing the run takes back');
+});
+
+test('route hint: the planner may pick a worker route per task; a pick that is not a worker route is dropped, a good one gets the first attempt', async () => {
+	const log = join(tmp('log'), 'prompts.jsonl');
+	const planned = plan(2).map((t, i) => ({ ...t, route: i === 0 ? 'local:qwen-steady' : 'ghost:none' }));
+	const { cwd, config, learning } = setup({ agents: { local: { models: ['qwen-steady'] } }, workers: ['claude:claude-fable-5-1', 'local:qwen-steady'], planning: { mode: 'direct' } }, planned, { JC_DEMO_LOG: log });
+	const project = new Project(cwd, tmp('store'));
+	const o = new Orchestrator(config, new StoreSource(project, cwd, 60), learning, cwd);
+	assert.deepEqual(await o.run('two tasks'), { done: 2, blocked: 0, review: 0 });
+	const notes = o.snapshot().activity.map((a) => a.text);
+	assert.ok(notes.includes('Ignored route picks that are not worker routes here: ghost:none'), notes.join('\n'));
+	assert.ok(notes.some((n) => /^T-0001 → local:qwen-steady: Task 1 · the planner's pick for this task$/.test(n)), 'the pick got the first attempt');
+	assert.ok(notes.some((n) => /^T-0002 → claude:claude-fable-5-1: Task 2$/.test(n)), 'no pick: your order');
+	assert.equal(project.get('T-0001')?.route, 'local:qwen-steady');
+	assert.equal(project.get('T-0002')?.route, undefined);
+	const planner = readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l)).find((p: string) => p.startsWith('JARVIS-CODE PLAN'))!;
+	assert.match(planner, /optionally "route": .*one of "claude:claude-fable-5-1", "local:qwen-steady"/);
+	assert.doesNotMatch(plannerPrompt('g', '/r', '', ['claude']), /"route"/, 'one worker route: nothing to pick');
+});
+
+test('receipt: the report shows each task\'s cost and time and a Spend section by role and route', async () => {
+	const { o, project } = pipelineSetup({}, {}, { planning: { mode: 'direct' } });
+	await o.run('add the loader');
+	const report = readFileSync(o.reportPath!, 'utf8');
+	assert.match(report, /\| task \| outcome \| route \| attempts \| cost \| time \| note \|/);
+	assert.match(report, /\| T-0001 Task 1 \| done \| claude:claude-fable-5-1 \| 1 \| \$\d+\.\d\d \| \d+s \|/);
+	assert.match(report, /## Spend\n\n\$\d+\.\d\d in all/);
+	assert.match(report, /- by role: (planner|worker) \$\d+\.\d\d \(1 run, \d+s\) · (planner|worker) /);
+	assert.match(report, /- by route: claude:claude-fable-5-1 \$\d+\.\d\d \(\d+ runs, \d+s\)/);
+	assert.ok(project.dir);
+});
+
+test('estimate: with run history the plan note says what the plan will likely cost and take; without it, nothing', async () => {
+	const fresh = pipelineSetup({}, {}, { planning: { mode: 'direct' } });
+	await fresh.o.run('add the loader');
+	assert.ok(fresh.o.snapshot().activity.some((a) => /^Planned 1 task with [^·]+$/.test(a.text)), 'no history: no estimate');
+	const { o, project } = pipelineSetup({}, {}, { planning: { mode: 'direct' } });
+	project.recordRun({ at: '2026-09-28T10:00:00.000Z', minutes: 10, total: 4, done: 4, blocked: 0, review: 0, cost: 2.5, planning: 0.5, agents: 9, stopped: false });
+	project.recordRun({ at: '2026-09-29T10:00:00.000Z', minutes: 6, total: 4, done: 3, blocked: 1, review: 0, cost: 1.5, planning: 0.5, agents: 7, stopped: false });
+	await o.run('add the loader');
+	// $3.00 of work and 16 minutes over 8 tasks: $0.38 and 2 min for one.
+	assert.ok(o.snapshot().activity.some((a) => /^Planned 1 task with .* · about \$0\.38 and 2 min at this project's pace \(2 runs\)$/.test(a.text)), o.snapshot().activity.map((a) => a.text).join('\n'));
 });
 
 test('brainstorm reads: brainstormers read the code read-only, cite a file per idea and keep their tools', async () => {
@@ -724,12 +860,12 @@ test('budget: a run stops at its time cap even while agents are quiet', async ()
 	assert.ok(Date.now() - t0 < 6000, 'stopped within a couple of seconds of the cap');
 });
 
-function reviewSetup(review: string, env: Record<string, string>, git = true) {
+function reviewSetup(review: string, env: Record<string, string>, git = true, planned = plan(1)) {
 	const log = join(tmp('log'), 'prompts.jsonl');
-	const agentEnv = { JC_DEMO_PACE: '2', JC_DEMO_PLAN: JSON.stringify({ tasks: plan(1) }), JC_DEMO_LOG: log, ...env };
+	const agentEnv = { JC_DEMO_PACE: '2', JC_DEMO_PLAN: JSON.stringify({ tasks: planned }), JC_DEMO_LOG: log, ...env };
 	const s = setup(
 		{ agents: { local: { models: ['qwen3-coder'], env: agentEnv } }, workers: ['claude:claude-fable-5-1', 'local:qwen3-coder'], planning: { mode: 'direct' }, review },
-		plan(1),
+		planned,
 		{ JC_DEMO_LOG: log, ...env },
 	);
 	if (git) execFileSync('git', ['init', '-q'], { cwd: s.cwd });
@@ -772,6 +908,22 @@ test('review gate: off, not a repository, or a risky-only mode on an S task clos
 	const fence = a.match(/BEGIN (DIFF-[0-9a-f]{12})/)?.[1];
 	assert.ok(fence && a.includes(`END ${fence}`) && fence !== reviewPrompt({ id: 'T-1', title: 't', acs: [] }, '').match(/BEGIN (DIFF-\w+)/)?.[1], 'a fresh fence per review');
 	assert.equal(parseVerdict('looks fine to me'), undefined);
+});
+
+test('review gate: an S task that changes CI or build config is reviewed even in risky mode, told why, with the goal', async () => {
+	const { o, prompts, notes } = reviewSetup('risky', {}, true, plan(1, () => 'test -f .github/workflows/ci.yml'));
+	assert.deepEqual(await o.run('one thing'), { done: 1, blocked: 0, review: 0 });
+	const review = prompts().find((p) => p.startsWith('JARVIS-CODE REVIEW'));
+	assert.match(review ?? '', /It changes how the project is built or checked \(\.github\/workflows\/ci\.yml\): make sure it does not weaken/);
+	assert.match(review ?? '', /The user's goal this task serves[^\n]*\n> one thing\n/, 'the goal, quoted as material');
+	assert.ok(notes().includes('M-0001 changes .github/workflows/ci.yml: reviewing it, since it could pass by weakening its own checks'), notes().join('\n'));
+});
+
+test('ask: never on a generic agent, which nothing keeps read-only; the next level answers, or none does', async () => {
+	const { cwd, config, learning } = setup({ planner: ['local:qwen-flaky'] }, []);
+	assert.equal((await ask(config, learning, cwd, 'why?')).route, 'claude:claude-fable-5-1', 'past the generic planner to an agent that enforces read-only');
+	config.agents.claude.enabled = false;
+	await assert.rejects(ask(config, learning, cwd, 'why?'), /no planner agent that can be kept read-only/);
 });
 
 test('replan: a blocked task is split once into smaller tasks that replace it; a split task is never split again', async () => {
@@ -863,7 +1015,7 @@ test('notify and report: the notify command gets each block and the digest; the 
 	const report = readFileSync(o.reportPath, 'utf8');
 	assert.match(report, /^# jarvis-code run: two things/);
 	assert.match(report, /\| T-0001 Task 1 \| done \| claude:claude-fable-5-1 \| 1 \|/);
-	assert.match(report, /\| T-0002 Task 2 \| blocked \| claude:claude-fable-5-1 \| 1 \| check failed: grep -q never out\/t2\.done \[agent: [^|\n]+\] \|/);
+	assert.match(report, /\| T-0002 Task 2 \| blocked \| claude:claude-fable-5-1 \| 1 \| \$\d+\.\d\d \| \d+[sm] \| check failed: grep -q never out\/t2\.done \[agent: [^|\n]+\] \|/);
 	assert.ok(report.indexOf('## Needs you') < report.indexOf('| task |'));
 	assert.match(report, /- T-0002 Task 2 \(blocked\): check failed: grep -q never out\/t2\.done \[agent: [^\n]+\] → .*jarvis-code task retry T-0002/);
 });

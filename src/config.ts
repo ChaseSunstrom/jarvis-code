@@ -93,7 +93,17 @@ export interface Config {
 	planning: {
 		/** `auto`: a prompt writer grounds every goal and open ones are brainstormed first · `direct`: one planner · `deep`: always brainstorm. */
 		mode: 'auto' | 'direct' | 'deep';
-		/** Brainstorm angles; the prompt writer may add up to 3 for the goal. */
+		/**
+		 * `tree`: one agent splits the goal into categories, then each category is expanded level by
+		 * level (broad ideas, then subtopics of the best of them, and so on) · `flat`: every lens in rounds.
+		 */
+		brainstorm: 'tree' | 'flat';
+		/**
+		 * The tree's bounds: `depth` levels counting the categories, up to `categories` of them, the best
+		 * `breadth` ideas of each category expanded at each level, and at most `maxCalls` agent sessions.
+		 */
+		tree: { depth: number; categories: number; breadth: number; maxCalls: number };
+		/** Brainstorm angles; the prompt writer may add up to 3 for the goal. A tree covers them in its categories. */
 		lenses: string[];
 		/** Most brainstorm rounds; a round adding fewer than `minNew` ideas ends it. */
 		rounds: number;
@@ -156,6 +166,8 @@ export const DEFAULTS: Config = {
 	budget: { usd: 0, minutes: 0 },
 	planning: {
 		mode: 'auto',
+		brainstorm: 'tree',
+		tree: { depth: 4, categories: 6, breadth: 3, maxCalls: 24 },
 		lenses: ['user value', 'reliability', 'simplicity', 'bold bets', 'unstated needs (what the user will want next without saying it)'],
 		rounds: 3,
 		minNew: 3,
@@ -227,6 +239,12 @@ export function normalize(raw: Config): Config {
 	const pl = raw.planning;
 	if (!['auto', 'direct', 'deep'].includes(pl.mode)) throw new Error('planning.mode: auto, direct or deep');
 	for (const k of ['rounds', 'parallel'] as const) if (!Number.isInteger(pl[k]) || pl[k] < 1) throw new Error(`planning.${k}: a whole number, 1 or more`);
+	if (!['tree', 'flat'].includes(pl.brainstorm)) throw new Error('planning.brainstorm: tree or flat');
+	// Every bound is capped: a tree's agent sessions are paid for, and a loop over them must end.
+	// A depth of 1 would stop at the categories, which are headings, not ideas: the planner would get nothing.
+	const bounds = { depth: [2, 6], categories: [1, 12], breadth: [1, 10], maxCalls: [1, 200] } as const;
+	for (const [k, [min, max]] of Object.entries(bounds) as [keyof typeof bounds, readonly [number, number]][])
+		if (!Number.isInteger(pl.tree?.[k]) || pl.tree[k] < min || pl.tree[k] > max) throw new Error(`planning.tree.${k}: a whole number from ${min} to ${max}`);
 	if (!Number.isInteger(pl.minNew) || pl.minNew < 0) throw new Error('planning.minNew: a whole number, 0 or more');
 	if (!Array.isArray(pl.lenses) || !pl.lenses.every((l) => typeof l === 'string')) throw new Error('planning.lenses: an array of angle names');
 	for (const k of ['critique', 'coverage'] as const) if (typeof pl[k] !== 'boolean') throw new Error(`planning.${k}: true or false`);

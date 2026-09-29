@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -17,10 +17,11 @@ import { Cockpit, matchCommands } from '../src/tui/Cockpit.js';
 import { Feed, Header, Tasks } from '../src/tui/parts.js';
 import { Reports, TaskDetail, Workers } from '../src/tui/parts.js';
 import { clauseMark, kindMark, MARKS, statusMark } from '../src/tui/style.js';
-import { DepTree, Graph } from '../src/tui/graph.js';
-import { PAGER_MAX, pageLines, Pager } from '../src/tui/pager.js';
+import { DepTree, flow, Graph, Ideas, lanes, Timeline } from '../src/tui/graph.js';
+import { diffstat, PAGER_MAX, pageLines, Pager } from '../src/tui/pager.js';
+import { Stats } from '../src/tui/stats.js';
 import { c } from '../src/theme.js';
-import type { Snapshot } from '../src/orchestrator.js';
+import { PULSE_MAX, type Snapshot } from '../src/orchestrator.js';
 import { sampleSnapshot } from './sample-snapshot.js';
 
 // ink-testing-library's stdout has no rows, so Ink asks the real terminal (env, then /dev/tty):
@@ -72,7 +73,7 @@ test('home lists stored projects and the slash menu completes commands', async (
 	ui.stdin.write('\r');
 	await sleep(60);
 	assert.match(frame(ui), /C O M M A N D S/);
-	assert.deepEqual(matchCommands('/st').map((c) => c.name), ['stop']);
+	assert.deepEqual(matchCommands('/st').map((c) => c.name), ['stop', 'stats'], '/stop stays first, so /st + Tab still stops');
 	ui.stdin.write('\x1b');
 	await sleep(30);
 	ui.stdin.write('a\tb\x07c');
@@ -228,10 +229,22 @@ test('the agents panel fits its height: two rows each, then one, then a count', 
 	assert.match(roomy[2], /└ reading 0/);
 	const compact = rows(4, 6);
 	assert.equal(compact.length, 5);
-	assert.match(compact[1], /lens 0, round 1 claude:m\s+reading 0/);
+	assert.match(compact[1], /lens 0, round 1 claude:m +▁{12}\s+reading 0/, 'a quiet agent: a flat pulse');
 	const many = rows(9, 6);
 	assert.equal(many.length, 6);
 	assert.match(many.at(-1)!, /… 5 more/);
+});
+
+test('workers pulse: an agent\'s last minute of events as a sparkline, busiest slot full', () => {
+	const now = 1_000_000_000_000; // on a 5 s slot boundary
+	const beats = [now - 2000, now - 2500, now - 3000, now - 4000, now - 32_000, now - 90_000];
+	const w = { key: 'T-0001', task: 'T-0001', title: 't', route: 'claude:m', phase: 'running' as const, started: now - 100_000, lastAt: now - 2000, tools: 6, last: 'editing', cost: 0, beats };
+	const ui = render(createElement(Workers, { workers: [w], t: 0, height: 4, now }));
+	const f = frame(ui).split('\n');
+	ui.unmount();
+	// 12 slots of 5 s: 1 event 30-35 s ago (the 6th slot), 4 in the last 5 s (the 12th); the one 90 s ago is out.
+	assert.match(f[1], /claude:m  ▁▁▁▁▁▃▁▁▁▁▁█  1m40s · 6 tools$/, 'and its times read from the same now');
+	assert.ok(PULSE_MAX >= 60, 'a busy minute fits');
 });
 
 test('workers status: each row shows its role, latest line and, once quiet, how long', () => {
@@ -243,9 +256,9 @@ test('workers status: each row shows its role, latest line and, once quiet, how 
 	assert.match(f[1], /worker T-0001 claude:m/);
 	assert.doesNotMatch(f[1], /quiet/);
 	assert.match(f[2], /└ line 10/);
-	assert.match(f[3], /reviewer review T-0002 claude:m\s+quiet 1m00s/);
+	assert.match(f[3], /reviewer review T-0002 claude:m +▁+\s+quiet 1m00s/);
 	assert.match(f[4], /└ line 60/);
-	assert.match(f[5], /planner planner claude:m\s+quiet 3m20s/);
+	assert.match(f[5], /planner planner claude:m +▁+\s+quiet 3m20s/);
 	assert.match(f[6], /└ line 200/);
 });
 
@@ -680,7 +693,7 @@ test('improve: /improve runs a grounded improvement goal for the selected projec
 	assert.match(run.goal ?? '', /^Improve this project, focusing on error handling: /);
 	assert.doesNotMatch(run.goal ?? '', /jarvis/i, 'about the project, never about jarvis-code');
 	assert.equal(run.o.config.planning.mode, 'deep');
-	assert.ok(run.o.snapshot().activity.some((a) => /^Brainstorm round 1/.test(a.text)), 'brainstormed even though the prompt writer called it concrete');
+	assert.ok(run.o.snapshot().activity.some((a) => /^Brainstorm tree: /.test(a.text)), 'brainstormed (as a tree, the default) even though the prompt writer called it concrete');
 });
 
 test('route command: /route sets, lists and clears session routes, refuses a bad key, and runs started afterwards use them', async (t) => {
@@ -771,6 +784,31 @@ test('header: cost shows the planning part', () => {
 	assert.doesNotMatch(header(1.5), /planning \$/);
 });
 
+test('header: beside the large reactor at 100 columns the tasks line stays one row, the bar shrinking to fit', () => {
+	const snap: Snapshot = { ...sampleSnapshot(), planning: 0.6, reactor: 'idle' };
+	const v = { ...normalize(DEFAULTS).ui, reactor: 'large' as const, learning: false };
+	const ui = render(createElement(Header, { snap, t: 0, v, depth: 'none', reactorRows: 17, tempo: 3, width: 100, style: normalize(DEFAULTS).ui.reactorStyle }));
+	const f = frame(ui).split('\n');
+	ui.unmount();
+	const row = f.find((l) => l.includes('TASKS'))!;
+	assert.match(row, /TASKS 1\/5 [▰▱]{6,} {2}COST \$1\.20 \(plan \$0\.60\) {2}TIME \d/, 'packed labels: cost, planning and time on the same row');
+});
+
+test('header: a stacked status bar, one segment per status, and route scores as bars', () => {
+	const snap: Snapshot = { ...sampleSnapshot(), planning: 0, reactor: 'idle', routes: [{ id: 'claude', off: false, score: 0.75, runs: 4 }, { id: 'codex', off: true, score: 0.2, runs: 5 }] };
+	const v = { ...normalize(DEFAULTS).ui, reactor: 'off' as const, learning: false };
+	const ui = render(createElement(Header, { snap, t: 0, v, depth: 'none', reactorRows: 2, tempo: 3, width: 120, style: normalize(DEFAULTS).ui.reactorStyle }));
+	const f = frame(ui);
+	ui.unmount();
+	// 1 done, 1 running, 1 failed, 2 queued over 30 cells: 6 + 6 + 6 filled, 12 empty.
+	const cells = f.match(/[▰▱]+/)?.[0] ?? '';
+	assert.equal(cells.length, 30);
+	assert.equal([...cells].filter((ch) => ch === '▱').length, 12);
+	assert.match(f, /1\/5/);
+	assert.match(f, /● claude █+[▏▎▍▌▋▊▉]? *75%/, 'a live route: its score as a bar');
+	assert.match(f, /✕ codex/, 'a route that is off says so');
+});
+
 test('background: the cockpit shows a run from another process, /stop ends it, and /detach hands its own run to the background', async (t) => {
 	const { config, manager, proj } = machine();
 	const other = spawn(process.execPath, ['-e', 'process.on("SIGTERM", () => process.exit(0)); setTimeout(() => {}, 30000)']);
@@ -813,7 +851,9 @@ test('graph view: goal, the stages that ran and their agent runs; a task lists i
 	};
 	const rows = draw(sampleSnapshot());
 	assert.match(rows[0], /G R A P H\s+10 agent runs · Esc to close/);
-	assert.equal(rows[1], 'Modernize the settings system');
+	assert.equal(rows[1], '● prompt writer 1 ▸ ● brainstorm 2 ▸ ● critique 1 ▸ ● planner 1 ▸ ◉ tasks 4 ▸ ◉ coverage 1', 'the flow: every stage, its state and runs');
+	assert.equal(rows[2], 'Modernize the settings system');
+	assert.deepEqual(flow([{ ...sampleSnapshot().nodes[0], state: 'failed' }]).map((f) => f.state), ['fail', 'wait', 'wait', 'wait', 'wait', 'wait'], 'a stage whose only run failed; the rest not reached');
 	const stages = rows.filter((r) => /^[├└]─ .* runs? · \$/.test(r)).map((r) => r.slice(3).split('  ')[0]);
 	assert.deepEqual(stages, ['prompt writer', 'brainstorm', 'critique', 'planner', 'tasks', 'coverage']);
 	assert.ok(rows.some((r) => /^│  └─ done +planning prompt  claude:claude-fable-5-1  1m00s · \$0\.12$/.test(r)), 'a node row: state tag, label, route, elapsed, cost');
@@ -843,7 +883,8 @@ test('graph clauses: done items sit under the goal row with a met, unmet or open
 		ui.unmount();
 		return f;
 	};
-	const rows = draw(sampleSnapshot());
+	// Row 1 is the stage flow; the tree starts under it.
+	const rows = draw(sampleSnapshot()).slice(1);
 	assert.equal(rows[1], 'Modernize the settings system');
 	assert.deepEqual(rows.slice(2, 5), [
 		'├─ met   settings load from disk  T-0001, T-0002',
@@ -853,6 +894,94 @@ test('graph clauses: done items sit under the goal row with a met, unmet or open
 	assert.match(rows[5], /^├─ prompt writer/);
 	assert.deepEqual([clauseMark('met')[1], clauseMark('unmet')[1], clauseMark('open')[1]], ['ok', 'warn', 'textFaint']);
 	assert.ok(!draw({ ...sampleSnapshot(), clauses: undefined }).some((r) => /settings load from disk/.test(r)), 'no clauses, no checklist');
+});
+
+test('timeline: every agent run on one time axis, a task\'s runs together, the newest rows kept', () => {
+	const snap = sampleSnapshot();
+	const now = snap.started + 300_000;
+	// Every sample node ran from 90 s to 30 s before the sample's now (the running ones to now).
+	const rows = lanes(snap.nodes, snap.started, now, 60);
+	assert.equal(rows.length, 10);
+	assert.deepEqual(rows.map((r) => r.label).slice(0, 5), ['prompt writer', 'r1 risk', 'r1 users', 'critique · 2 ideas', 'planner']);
+	assert.deepEqual([rows[0].from, rows[0].to], [42, 54], '210 s to 270 s of 300 s over 60 cells');
+	const t1 = rows.findIndex((r) => r.label === 'T-0001 worker');
+	assert.equal(rows[t1 + 1].label, 'T-0001 reviewer', 'a task\'s review sits under its worker');
+	const running = rows.find((r) => r.label === 'T-0002 worker')!;
+	assert.equal(running.to, 60, 'a running agent reaches now');
+	assert.ok(rows.every((r) => r.to > r.from && r.to <= 60));
+	// A task's second worker run (a retry) is numbered, so its rows tell apart.
+	const retry = lanes([...snap.nodes, { ...snap.nodes[5], id: 'T-0001#11', state: 'failed' }], snap.started, now, 60).filter((r) => r.label.startsWith('T-0001'));
+	assert.deepEqual(retry.map((r) => r.label), ['T-0001 worker', 'T-0001 reviewer', 'T-0001 worker 2']);
+	// A run that starts and ends in the same instant still gets a cell.
+	const blink = lanes([{ ...snap.nodes[0], started: now, ended: now }], snap.started, now, 60)[0];
+	assert.deepEqual([blink.from, blink.to], [59, 60]);
+
+	const draw = (height: number) => {
+		const ui = render(createElement(Timeline, { snap, height, width: 96, now }));
+		const f = frame(ui).split('\n');
+		ui.unmount();
+		return f;
+	};
+	const all = draw(20);
+	assert.match(all[0], /T I M E L I N E\s+10 agent runs · Esc to close/);
+	assert.match(all[1], /prompt.*brainstorm.*critic.*planner.*worker.*reviewer.*coverage/, 'a legend names the colours');
+	assert.ok(all.some((r) => /^T-0002 worker +─+█+ +1m3\ds · \$0\.12$/.test(r)), 'a row: label, track, bar to now, time and cost');
+	assert.match(all.at(-1)!, /0s +2m30s +5m00s$/, 'the axis: start, middle, now');
+	const clipped = draw(8);
+	assert.match(clipped[2], /… 6 earlier/);
+	assert.ok(clipped.some((r) => r.startsWith('coverage')), 'the newest run stays in view');
+});
+
+test('stats: task mix, cost by role and route, route scores and sparklines over the run', () => {
+	const snap: Snapshot = { ...sampleSnapshot(), routes: [{ id: 'claude:claude-fable-5-1', off: false, score: 0.8, runs: 5 }, { id: 'codex:gpt-5', off: true, score: 0.2, runs: 4 }] };
+	const now = snap.started + 300_000;
+	const ui = render(createElement(Stats, { snap, height: 30, width: 96, now }));
+	const f = frame(ui);
+	ui.unmount();
+	assert.match(f, /S T A T S/);
+	assert.match(f, /1 done {2}1 running {2}1 failed {2}2 queued/);
+	assert.match(f, /brainstorm +█+[▉▊▋▌▍▎▏]? +\$0\.24 · 2 runs, 1 failed/, 'a role: its cost as a bar, runs and failures');
+	assert.match(f, /worker +█+ +\$0\.36 · 3 runs, 1 failed/, 'the costliest role fills its bar');
+	assert.match(f, /claude:claude-… +█+ +\$0\.96 · 8/, 'cost by route, largest first');
+	assert.match(f, /codex:gpt-5 +█*[▉▊▋▌▍▎▏]? +off · 4 runs/, 'a route that is off');
+	assert.match(f, /runs done +[▁-█]+ +8/, '8 of the 10 sample runs have ended');
+	assert.match(f, /spend +[▁-█]+ +\$0\.96/);
+	const empty = render(createElement(Stats, { snap: { ...snap, nodes: [], tasks: [], routes: [] }, height: 30, width: 96, now }));
+	// The two columns interleave rows, so each empty note is looked for on its own.
+	for (const note of [/no tasks yet/, /no agent has run yet/, /nothing learned yet/]) assert.match(frame(empty), note);
+	empty.unmount();
+});
+
+test('ideas pane: the brainstorm tree with value bars and critic scores, scrolled by top; flat ideas under their lens', () => {
+	const tree: Snapshot['ideas'] = [
+		{ id: '1', title: 'Interface', depth: 1 },
+		{ id: '1.1', parent: '1', title: 'Charts', depth: 2, effort: 'M', value: 4, critique: { value: 5, effort: 2, risk: 1 }, score: 7 },
+		{ id: '1.1.1', parent: '1.1', title: 'Sparklines', depth: 3, effort: 'S', value: 3 },
+		{ id: '1.2', parent: '1', title: 'Tabs', depth: 2, value: 2, merged: 2 },
+		{ id: '2', title: 'Speed', depth: 1 },
+	];
+	const draw = (ideas: Snapshot['ideas'], height = 20, top = 0) => {
+		const ui = render(createElement(Ideas, { ideas, height, top }));
+		const f = frame(ui).split('\n');
+		ui.unmount();
+		return f;
+	};
+	const rows = draw(tree);
+	assert.match(rows[0], /I D E A S\s+3 ideas · 2 categories · Esc to close/);
+	assert.deepEqual(rows.slice(1, 6), [
+		'      Interface',
+		'█████ ├─ Charts  M  v5 e2 r1',
+		'███   │  └─ Sparklines  S',
+		'██    └─ Tabs  +2',
+		'      Speed',
+	], 'the value bars line up in one column, before the tree');
+	const scrolled = draw(tree, 3, 2);
+	assert.match(scrolled[0], /3–4 of 5 · PgUp\/PgDn/);
+	assert.match(scrolled[1], /Sparklines/);
+	const flat = draw([{ title: 'Cache it', lens: 'speed' }, { title: 'Guard it', lens: 'safety' }, { title: 'Batch it', lens: 'speed' }]);
+	assert.match(flat[0], /3 ideas · 2 angles/);
+	assert.deepEqual(flat.slice(1, 6), ['      speed', '      ├─ Cache it', '      └─ Batch it', '      safety', '      └─ Guard it']);
+	assert.match(draw(undefined).join('\n'), /no brainstorm in this run yet/);
 });
 
 test('tree view: tasks by their depends, a second dependency as a reference row, cycles marked', () => {
@@ -911,7 +1040,7 @@ test('graph command: /graph and /tree toggle a pane over the run body, Esc close
 	await sleep(100);
 	let f = await send('/graph');
 	assert.match(f, /G R A P H/);
-	assert.match(f, /G R A P H.*\n.*Modernize the settings system.*\n.*├─ met   the settings load from src\/config\.ts  M-0001/, 'the checklist first, under the goal');
+	assert.match(f, /G R A P H.*\n.*● prompt writer 1 ▸ ● brainstorm \d+ ▸.* ● coverage 1 .*\n.*Modernize the settings system/, 'the flow, whole at 100 columns, then the goal');
 	assert.doesNotMatch(f, /Q U E U E/, 'the pane takes the whole body');
 	f = await send('/graph');
 	assert.doesNotMatch(f, /G R A P H/, 'a second /graph closes it');
@@ -922,6 +1051,26 @@ test('graph command: /graph and /tree toggle a pane over the run body, Esc close
 	f = await send('/graph');
 	assert.match(f, /G R A P H/, '/graph swaps the tree for the graph');
 	assert.doesNotMatch(f, /T R E E/);
+	f = await send('/timeline');
+	assert.match(f, /T I M E L I N E/);
+	assert.match(f, /prompt writer.*█/, 'the demo run\'s agent runs are bars');
+	assert.doesNotMatch(f, /G R A P H/);
+	f = await send('/stats');
+	assert.match(f, /S T A T S/);
+	assert.match(f, /C O S T   B Y   R O L E/);
+	assert.doesNotMatch(f, /T I M E L I N E/);
+	f = await send('/ideas');
+	assert.match(f, /I D E A S\s+\d+ ideas · 3 categories/, 'the demo brainstorms as a tree');
+	assert.match(f, /^.*Interface/m);
+	const shown = Number(f.match(/ 1–(\d+) of \d+ · PgUp\/PgDn/)?.[1]);
+	assert.ok(shown > 1, 'the demo tree is taller than the pane at 24 rows');
+	ui.stdin.write('\x1b[6~');
+	await sleep(60);
+	assert.match(frame(ui), new RegExp(` ${shown}–\\d+ of \\d+ · PgUp/PgDn`), 'PgDn scrolls the tree a page, keeping a row');
+	ui.stdin.write('\x1b[5~');
+	await sleep(60);
+	assert.match(frame(ui), / 1–\d+ of \d+ · PgUp\/PgDn/, 'PgUp comes back to the top');
+	f = await send('/graph');
 	ui.stdin.write('\x1b');
 	await sleep(60);
 	f = frame(ui);
@@ -930,6 +1079,257 @@ test('graph command: /graph and /tree toggle a pane over the run body, Esc close
 	ui.stdin.write('\x1b');
 	await sleep(60);
 	assert.match(frame(ui), /P R O J E C T S/, 'the next Esc goes home');
+});
+
+test('history pane: /history shows the project\'s finished runs with sparklines, read once; Esc closes it', async (t) => {
+	const { config, manager, proj } = machine();
+	const p = new Project(proj);
+	p.recordRun({ at: '2026-09-28T10:00:00.000Z', minutes: 12, goal: 'first goal', total: 4, done: 2, blocked: 1, review: 0, cost: 1.5, planning: 0.5, agents: 9, stopped: false });
+	const ui = render(createElement(Cockpit, { manager, config, depth: 'none', cwd: proj }));
+	t.after(() => ui.unmount());
+	await sleep(50);
+	await type(ui, '/history');
+	ui.stdin.write('\r');
+	await sleep(60);
+	let f = frame(ui);
+	assert.match(f, /H I S T O R Y\s+1 run · \/history to close/);
+	assert.match(f, /cost +█ +\$1\.50 in all/);
+	assert.match(f, /success +▅ +50% of 4 tasks done/);
+	assert.match(f, /09-28 10:00 +2\/4 ███ +\$ +1\.50 +12m +first goal/);
+	p.recordRun({ at: '2026-09-29T10:00:00.000Z', minutes: 1, goal: 'later goal', total: 1, done: 1, blocked: 0, review: 0, cost: 0.1, planning: 0, agents: 2, stopped: false });
+	await sleep(300);
+	assert.doesNotMatch(frame(ui), /later goal/, 'read when the command ran, not in render');
+	ui.stdin.write('\x1b');
+	await sleep(60);
+	f = frame(ui);
+	assert.doesNotMatch(f, /H I S T O R Y/);
+});
+
+test('feed follows the selected task: ↑↓ in a run filters the activity to it; Esc shows everything again', async (t) => {
+	const { config, manager, root } = machine();
+	const ui = render(createElement(Cockpit, { manager, config, depth: 'none', cwd: root, fast: true }));
+	t.after(() => {
+		ui.unmount();
+		return manager.stopAll();
+	});
+	await sleep(50);
+	await type(ui, '/demo');
+	ui.stdin.write('\r');
+	for (let i = 0; i < 200 && !manager.list()[0]?.finished; i++) await sleep(50);
+	await sleep(100);
+	const feedOf = (f: string) => f.slice(f.indexOf('A C T I V I T Y'));
+	assert.match(feedOf(frame(ui)), /M-0007/, 'everything at first');
+	ui.stdin.write('\x1b[B');
+	await sleep(60);
+	let f = frame(ui);
+	assert.match(f, /M-0001 only · Esc for all/);
+	assert.doesNotMatch(feedOf(f).split('\n').slice(1).join('\n'), /M-000[2-7]/, 'only the selected task\'s lines');
+	assert.match(feedOf(f), /M-0001/);
+	ui.stdin.write('\x1b');
+	await sleep(60);
+	f = frame(ui);
+	assert.doesNotMatch(f, /only · Esc for all/);
+	assert.match(f, /Q U E U E/, 'Esc cleared the selection and stayed in the run');
+	assert.match(feedOf(f), /M-0007/);
+});
+
+test('ask command: /ask runs a read-only agent on the project and pages its wrapped answer', async (t) => {
+	const { config, manager, proj } = machine();
+	const log = join(proj, '..', 'ask.jsonl');
+	writeFileSync(join(proj, '.jarvis-code.json'), JSON.stringify({ agents: { claude: { kind: 'claude', enabled: true, bin: demoAgent, models: ['claude-fable-5-1'], env: { JC_DEMO_PACE: '2', JC_DEMO_LOG: log } } }, planner: ['claude:claude-fable-5-1'] }));
+	const ui = render(createElement(Cockpit, { manager, config, depth: 'none', cwd: proj }));
+	t.after(() => ui.unmount());
+	await sleep(50);
+	await type(ui, '/ask');
+	ui.stdin.write('\r');
+	await sleep(60);
+	assert.match(frame(ui), /\/ask <question>/);
+	await type(ui, '/ask why did T-0001 take so long');
+	ui.stdin.write('\r');
+	for (let i = 0; i < 100 && !/A N S W E R/.test(frame(ui)); i++) await sleep(50);
+	let f = frame(ui);
+	assert.match(f, /A N S W E R +1–\d+ of \d+ · PgUp\/PgDn · Esc to close │\n.*Q: why did T-0001 take so long/, 'the title stays one row');
+	assert.match(f, /answered by claude:claude-fable-5-1/);
+	ui.stdin.write('\x1b[6~');
+	await sleep(60);
+	f = frame(ui);
+	assert.match(f, /You asked: why did T-0001 take so long/);
+	assert.ok(f.split('\n').every((l) => l.length <= 100), 'the answer is wrapped to the pane');
+	const prompt = JSON.parse(readFileSync(log, 'utf8').trim().split('\n')[0]);
+	assert.match(prompt, /^JARVIS-CODE ASK/);
+	assert.match(prompt, /tasks\/T-\*\.json/, 'the prompt maps the store');
+	assert.doesNotMatch(prompt, /\[no tools\]/, 'it may read');
+});
+
+test('plan command: /plan plans into the queue and stops, the queue waits for /work; refused while a run is going', async (t) => {
+	const { config, manager, proj } = machine();
+	writeFileSync(join(proj, '.jarvis-code.json'), JSON.stringify({ agents: { claude: { kind: 'claude', enabled: true, bin: demoAgent, models: ['claude-fable-5-1'], env: { JC_DEMO_PACE: '2' } } }, planner: ['claude:claude-fable-5-1'], workers: ['claude:claude-fable-5-1'], planning: { mode: 'direct' } }));
+	const ui = render(createElement(Cockpit, { manager, config, depth: 'none', cwd: proj }));
+	t.after(() => {
+		ui.unmount();
+		return manager.stopAll();
+	});
+	await sleep(50);
+	new Project(proj).enqueue('a goal queued earlier');
+	await type(ui, '/plan make the loader faster');
+	ui.stdin.write('\r');
+	for (let i = 0; i < 100 && !manager.list()[0]?.finished; i++) await sleep(50);
+	await sleep(100);
+	const f = frame(ui);
+	assert.match(f, /Plan only: \d+ tasks? queued, none started/);
+	const p = new Project(proj);
+	assert.ok(p.tasks().length && p.tasks().every((x) => x.status === 'planned'), 'planned, none worked');
+	assert.equal(manager.list().length, 1, 'the queued goal was not drained: it would work the plan');
+	assert.deepEqual(p.goals().map((g) => g.goal), ['a goal queued earlier']);
+	p.lock({ goal: 'elsewhere', pid: process.pid });
+	t.after(() => p.unlock());
+	await type(ui, '/plan another');
+	ui.stdin.write('\r');
+	await sleep(80);
+	assert.match(frame(ui), /has a run going: \/plan once it ends/);
+});
+
+test('issue command: /issue n reads the issue with gh and starts a run on it', async (t) => {
+	const { config, manager, proj } = machine();
+	writeFileSync(join(proj, '.jarvis-code.json'), JSON.stringify({ agents: { claude: { kind: 'claude', enabled: true, bin: demoAgent, models: ['claude-fable-5-1'], env: { JC_DEMO_PACE: '2' } } }, planner: ['claude:claude-fable-5-1'], workers: ['claude:claude-fable-5-1'], planning: { mode: 'direct' } }));
+	const bin = mkdtempSync(join(tmpdir(), 'jc-gh-'));
+	writeFileSync(join(bin, 'gh'), `#!/usr/bin/env node\nconsole.log(JSON.stringify({ number: 7, title: 'Loader crashes', body: 'It crashes.', url: 'https://github.com/o/r/issues/7' }));\n`, { mode: 0o755 });
+	const path = process.env.PATH;
+	process.env.PATH = `${bin}:${path}`;
+	const ui = render(createElement(Cockpit, { manager, config, depth: 'none', cwd: proj }));
+	t.after(() => {
+		process.env.PATH = path;
+		ui.unmount();
+		return manager.stopAll();
+	});
+	await sleep(50);
+	await type(ui, '/issue');
+	ui.stdin.write('\r');
+	await sleep(60);
+	assert.match(frame(ui), /\/issue <n>: a GitHub issue/);
+	await type(ui, '/issue 7');
+	ui.stdin.write('\r');
+	for (let i = 0; i < 60 && !manager.list().length; i++) await sleep(50);
+	assert.match(manager.list()[0]?.goal ?? '', /^Resolve GitHub issue #7: Loader crashes \(https:\/\/github\.com\/o\/r\/issues\/7\)\n[\s\S]*^> It crashes\.$/m);
+});
+
+test('review pane: every task needing you with why, next and its patch; ↑↓ picks, /task acts on the pick, Enter pages its patch', async (t) => {
+	const { config, manager, proj } = machine();
+	const p = new Project(proj);
+	p.add([{ title: 'Second thing' }, { title: 'Third thing' }]);
+	p.setStatus('T-0001', 'blocked', 'jarvis-code: check failed: npm test');
+	p.setStatus('T-0002', 'review', 'passed, but its changes do not apply to the main tree as it is now');
+	const patch = p.research('patch-T-0002-1-x', 'diff --git a/src/a.ts b/src/a.ts\n@@ -1 +1,2 @@\n-a\n+b\n+c\n');
+	p.update('T-0002', (x) => x.attempts.push({ at: new Date().toISOString(), route: 'claude', ok: true, patch }));
+	const ui = render(createElement(Cockpit, { manager, config, depth: 'none', cwd: proj }));
+	t.after(() => ui.unmount());
+	await sleep(50);
+	await type(ui, '/review');
+	ui.stdin.write('\r');
+	await sleep(80);
+	let f = frame(ui);
+	assert.match(f, /R E V I E W\s+1 of 2 need you/);
+	assert.match(f, /▌blocked T-0001 Wire the parser/);
+	assert.match(f, /why {2}check failed: npm test/);
+	assert.match(f, /next jarvis-code task retry T-0001/);
+	assert.match(f, /patch none kept/);
+	ui.stdin.write('\x1b[B');
+	await sleep(60);
+	f = frame(ui);
+	assert.match(f, /2 of 2 need you/);
+	assert.match(f, /▌review {2}T-0002 Second thing/);
+	assert.match(f, /patch 1 file changed, 2 insertions\(\+\), 1 deletion\(-\): src\/a\.ts/);
+	ui.stdin.write('\r');
+	await sleep(60);
+	assert.match(frame(ui), /D I F F   T - 0 0 0 2/, 'Enter pages the picked task\'s patch');
+	ui.stdin.write('\x1b');
+	await sleep(60);
+	assert.match(frame(ui), /R E V I E W/, 'Esc comes back to the list');
+	await type(ui, '/task drop not needed');
+	ui.stdin.write('\r');
+	await sleep(100);
+	assert.equal(p.get('T-0002')?.status, 'dropped', '/task acted on the picked task');
+	f = frame(ui);
+	assert.match(f, /1 of 1 need you/, 'the list refreshed');
+	assert.match(f, /▌blocked T-0001/);
+});
+
+test('find command: /find lists matching tasks with status and where; Esc closes it', async (t) => {
+	const { config, manager, proj } = machine();
+	const ui = render(createElement(Cockpit, { manager, config, depth: 'none', cwd: proj }));
+	t.after(() => ui.unmount());
+	await sleep(50);
+	await type(ui, '/find');
+	ui.stdin.write('\r');
+	await sleep(60);
+	assert.match(frame(ui), /\/find <text>/);
+	await type(ui, '/find parser');
+	ui.stdin.write('\r');
+	await sleep(80);
+	let f = frame(ui);
+	assert.match(f, /F I N D   P A R S E R\s+1 task · Esc to close/);
+	assert.match(f, /planned +T-0001 Wire the parser +in title/);
+	ui.stdin.write('\x1b');
+	await sleep(60);
+	f = frame(ui);
+	assert.doesNotMatch(f, /F I N D/);
+});
+
+test('undo command: /undo needs a task, and one with no landed patch says so', async (t) => {
+	const { config, manager, proj } = machine();
+	const ui = render(createElement(Cockpit, { manager, config, depth: 'none', cwd: proj }));
+	t.after(() => ui.unmount());
+	await sleep(50);
+	await type(ui, '/undo');
+	ui.stdin.write('\r');
+	await sleep(60);
+	assert.match(frame(ui), /\/undo \[task\|run\]: pick a task/);
+	await type(ui, '/undo t-0001');
+	ui.stdin.write('\r');
+	await sleep(150);
+	assert.match(frame(ui), /no landed patch kept for T-0001: nothing to undo/);
+	await type(ui, '/undo run');
+	ui.stdin.write('\r');
+	await sleep(150);
+	assert.match(frame(ui), /no run here has landed tasks still in the tree/);
+});
+
+test('pane cycle: with an empty prompt in a run, Tab walks the views and Shift+Tab walks back; a pane takes most of the room', async (t) => {
+	const { config, manager, root } = machine();
+	const ui = render(createElement(Cockpit, { manager, config, depth: 'none', cwd: root, fast: true }));
+	t.after(() => {
+		ui.unmount();
+		return manager.stopAll();
+	});
+	await sleep(50);
+	ui.stdin.write('\t');
+	await sleep(40);
+	assert.match(frame(ui), /P R O J E C T S/, 'at home Tab does nothing');
+	await type(ui, '/demo');
+	ui.stdin.write('\r');
+	for (let i = 0; i < 200 && !manager.list()[0]?.finished; i++) await sleep(50);
+	await sleep(100);
+	const rowsOf = (f: string, label: RegExp) => {
+		const lines = f.split('\n');
+		const at = lines.findIndex((l) => label.test(l));
+		return lines.slice(at).findIndex((l) => l.includes('╰'));
+	};
+	const queueRows = rowsOf(frame(ui), /Q U E U E/);
+	for (const label of ['G R A P H', 'T R E E', 'T I M E L I N E', 'S T A T S', 'I D E A S', 'Q U E U E']) {
+		ui.stdin.write('\t');
+		await sleep(60);
+		assert.match(frame(ui), new RegExp(label), `Tab reached ${label}`);
+	}
+	ui.stdin.write('\x1b[Z');
+	await sleep(60);
+	const f = frame(ui);
+	assert.match(f, /I D E A S/, 'Shift+Tab went back');
+	assert.ok(rowsOf(f, /I D E A S/) > queueRows, 'the pane is taller than the queue view');
+	assert.match(f, /Tab views/);
+	await type(ui, '/he');
+	ui.stdin.write('\t');
+	await sleep(40);
+	assert.match(frame(ui), /❯ \/help▏/, 'with text in the prompt, Tab still completes');
 });
 
 test('diff pager: markers coloured, binary folded, a window of height lines from top, capped with a count', () => {
@@ -967,10 +1367,21 @@ test('diff pager: markers coloured, binary folded, a window of height lines from
 	assert.ok(!lines.some((l) => /literal|KcmZ|HcmV/.test(l.text)), 'binary contents are not shown');
 	assert.equal(lines.at(-1)?.text, '[binary]', 'no trailing blank line');
 
-	const ui = render(createElement(Pager, { text: patch, height: 3, top: 5 }));
+	// A diffstat opens the pager: a row per file, a total, and a blank row before the patch.
+	const stat = diffstat(patch);
+	assert.deepEqual(stat.map((l) => l.text), [' x.ts    | 3 +--', ' img.png | bin', ' y.bin   | bin', ' 3 files changed, 1 insertion(+), 2 deletions(-)', '']);
+	assert.deepEqual(stat[0].parts?.map((p) => p.color), [c.text, c.tick, c.textDim, c.ok, c.danger], 'the path, the bar: + green and - red');
+	const wide = diffstat(`diff --git a/big.ts b/big.ts\n@@ -1 +1 @@\n${'+x\n'.repeat(90)}${'-y\n'.repeat(30)}`, 40);
+	assert.equal(wide[0].text, ` big.ts | 120 ${'+'.repeat(30)}${'-'.repeat(10)}`, 'scaled to the width, in proportion');
+	assert.deepEqual(diffstat('+row 1\n+row 2'), [], 'not a diff: no stat');
+
+	const ui = render(createElement(Pager, { text: patch, height: 3, top: 10 }));
 	const f = frame(ui);
 	ui.unmount();
 	assert.deepEqual(f.split('\n').map((l) => l.trimEnd()), [' keep  me', '-old', '+new']);
+	const head = render(createElement(Pager, { text: patch, height: 2, top: 0 }));
+	assert.deepEqual(frame(head).split('\n').map((l) => l.trimEnd()), [' x.ts    | 3 +--', ' img.png | bin']);
+	head.unmount();
 
 	const long = Array.from({ length: PAGER_MAX + 3 }, (_, i) => `+row ${i + 1}`).join('\n');
 	const capped = pageLines(long);
@@ -1012,14 +1423,18 @@ test('diff command: /diff pages a task\'s last patch, read once; no patch says s
 	await send('/task show T-0001');
 	let f = await send('/diff');
 	assert.match(f, /D I F F/);
-	assert.match(f, /diff --git a\/f b\/f/);
+	assert.match(f, / f \| 30 \++/, 'the diffstat comes first');
+	assert.match(f, /1 file changed, 30 insertions\(\+\), 0 deletions\(-\)/);
 	assert.doesNotMatch(f, /Wire the parser/, 'the pager takes the whole body');
 	writeFileSync(file, 'diff --git a/g b/g\n+rewritten\n');
+	// Two pages down: past the diffstat and the patch's own header.
+	ui.stdin.write('\x1b[6~');
+	await sleep(60);
 	ui.stdin.write('\x1b[6~');
 	await sleep(60);
 	f = frame(ui);
-	assert.doesNotMatch(f, /diff --git a\/f/, 'PgDn scrolls the pager');
-	assert.match(f, /\+row \d\d/);
+	assert.doesNotMatch(f, /1 file changed/, 'PgDn scrolls the pager');
+	assert.match(f, /\+row \d/);
 	assert.doesNotMatch(f, /rewritten|a\/g/, 'the patch is read once, when the command runs');
 	ui.stdin.write('\x1b[5~');
 	await sleep(60);
@@ -1036,7 +1451,7 @@ test('diff command: /diff pages a task\'s last patch, read once; no patch says s
 	run.o.patch = (id) => (id === 'T-0002' ? 'diff --git a/live b/live\n+from the run\n' : undefined);
 	f = await send('/diff t-0002');
 	assert.match(f, /D I F F/);
-	assert.match(f, /\+from the run/);
+	assert.match(f, / live \| /, 'the live run\'s patch, from its diffstat on');
 });
 
 /** A project whose runs use the slow demo agent, so a run stays live while the test types. */
