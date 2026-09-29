@@ -9,6 +9,7 @@ import { large, ring, spinner, WORDS, type ReactorState } from '../reactor.js';
 import { sameModel } from '../agents/types.js';
 import type { Project, StoredTask } from '../store.js';
 import { c, type ColorDepth } from '../theme.js';
+import { bar, bins, sparkline, split } from './charts.js';
 import { cap, clock, elapsed, kindMark, ORDER, statusMark, visible, type View } from './style.js';
 
 /** States the reactor moves in; idle, stopped and offline are drawn still. */
@@ -23,7 +24,8 @@ export function Label({ text, right }: { text: string; right?: string }) {
 	return (
 		// A panel's title never gives way: when rows run out, the bottom is clipped instead.
 		<Box justifyContent="space-between" width="100%" flexShrink={0}>
-			<Text color={c.textDim}>{cap(text)}</Text>
+			{/* One row always: a long title is cut, never wrapped under the pane's first line. */}
+			<Text color={c.textDim} wrap="truncate-end">{cap(text)}</Text>
 			{right ? <Text color={c.textFaint}>{right}</Text> : null}
 		</Box>
 	);
@@ -59,14 +61,20 @@ export function ReactorView({ snap, t, rows, depth, tempo, style }: { snap: Snap
 	);
 }
 
-export function Progress({ done, total, width }: { done: number; total: number; width: number }) {
-	const n = total ? Math.round((done / total) * width) : 0;
-	return (
-		<Text>
-			<Text color={c.accent}>{'▰'.repeat(n)}</Text>
-			<Text color={c.line}>{'▱'.repeat(width - n)}</Text>
-		</Text>
-	);
+/** Status groups of the stacked bar, left to right: finished, moving, waiting on you, failed, not started. */
+const BAR: { statuses: TaskStatus[]; tone: string; fill: boolean }[] = [
+	{ statuses: ['done'], tone: c.ok, fill: true },
+	{ statuses: ['running', 'verifying'], tone: c.accent, fill: true },
+	{ statuses: ['blocked', 'review'], tone: c.warn, fill: true },
+	{ statuses: ['failed'], tone: c.danger, fill: true },
+	{ statuses: ['queued'], tone: c.line, fill: false },
+];
+
+/** The run's tasks as one stacked bar, a segment per status group in proportion (split tasks don't count). */
+export function Progress({ tasks, width }: { tasks: TaskView[]; width: number }) {
+	const cells = split(BAR.map((g) => tasks.filter((t) => g.statuses.includes(t.status)).length), width);
+	if (!cells.some(Boolean)) return <Text color={c.line}>{'▱'.repeat(width)}</Text>;
+	return <Text>{BAR.map((g, i) => (cells[i] ? <Text key={i} color={g.tone}>{(g.fill ? '▰' : '▱').repeat(cells[i])}</Text> : null))}</Text>;
 }
 
 export function Header({ snap, t, v, depth, reactorRows, tempo, width, style, line }: { snap: Snapshot; t: number; v: View; depth: ColorDepth; reactorRows: number; tempo: number; width: number; style: Config['ui']['reactorStyle']; line?: string }) {
@@ -74,6 +82,18 @@ export function Header({ snap, t, v, depth, reactorRows, tempo, width, style, li
 	const done = count('done');
 	const word = snap.paused ? 'Paused' : snap.phase === 'finished' ? (snap.reactor === 'attention' ? 'Finished · needs you' : 'Finished') : WORDS[snap.reactor];
 	const stateColor = snap.paused ? c.warn : STATE_COLOR[snap.reactor];
+	// The tasks line fits beside the reactor (the large one is about two columns a row): past about
+	// 75 columns of room it spells its labels out; with less they pack tight and the bar gives way.
+	const beside = width - 6 - (v.reactor === 'off' ? 0 : reactorRows > 2 ? reactorRows * 2 + 3 : 5);
+	const narrow = beside < 75;
+	const label = (s: string) => (narrow ? s.toUpperCase() : cap(s));
+	const gap = narrow ? '  ' : '   ';
+	const counted = `${done}/${snap.tasks.length} `;
+	const money = `$${snap.cost.toFixed(2)}`;
+	const planning = snap.planning ? (narrow ? ` (plan $${snap.planning.toFixed(2)})` : ` planning $${snap.planning.toFixed(2)}`) : '';
+	const took = elapsed(Date.now() - snap.started);
+	const text = [label('tasks'), counted, gap, label('cost'), money, planning, gap, label('time'), took].join('').length + 3;
+	const barW = Math.max(6, Math.min(30, beside - text));
 	return (
 		<Box>
 			{v.reactor !== 'off' ? <ReactorView snap={snap} t={t} rows={reactorRows} depth={depth} tempo={tempo} style={style} /> : null}
@@ -94,22 +114,25 @@ export function Header({ snap, t, v, depth, reactorRows, tempo, width, style, li
 					{line !== undefined ? <Text color={c.text}>{'  ' + line}</Text> : snap.goal ? <Text color={c.text}>{'  ' + snap.goal}</Text> : <Text color={c.textDim}>{'  working the queue'}</Text>}
 				</Text>
 				<Text> </Text>
-				<Text>
-					<Text color={c.textDim}>{cap('tasks') + ' '}</Text>
-					<Text color={c.textBright}>{`${done}/${snap.tasks.length} `}</Text>
-					<Progress done={done} total={snap.tasks.length} width={Math.max(8, Math.min(30, width - 70) - (snap.planning ? 6 : 0))} />
-					<Text color={c.textDim}>{'   ' + cap('cost') + ' '}</Text>
-					<Text color={c.textBright}>{`$${snap.cost.toFixed(2)}`}</Text>
-					{snap.planning ? <Text color={c.textDim}>{` planning $${snap.planning.toFixed(2)}`}</Text> : null}
-					<Text color={c.textDim}>{'   ' + cap('time') + ' '}</Text>
-					<Text color={c.textBright}>{elapsed(Date.now() - snap.started)}</Text>
+				<Text wrap="truncate-end">
+					<Text color={c.textDim}>{label('tasks') + ' '}</Text>
+					<Text color={c.textBright}>{counted}</Text>
+					<Progress tasks={snap.tasks} width={barW} />
+					<Text color={c.textDim}>{gap + label('cost') + ' '}</Text>
+					<Text color={c.textBright}>{money}</Text>
+					{planning ? <Text color={c.textDim}>{planning}</Text> : null}
+					<Text color={c.textDim}>{gap + label('time') + ' '}</Text>
+					<Text color={c.textBright}>{took}</Text>
 				</Text>
 				<Text wrap="truncate-end">
 					{count('blocked') ? <Text color={c.warn}>{`⊘ ${count('blocked')} blocked  `}</Text> : null}
 					{count('review') ? <Text color={c.warn}>{`◇ ${count('review')} to review  `}</Text> : null}
 					{snap.routes.map((r) => (
 						<Text key={r.id} color={r.off ? c.danger : r.runs ? c.text : c.textDim}>
-							{`${r.off ? '✕' : '●'} ${r.id}${r.runs ? ` ${Math.round(r.score * 100)}%` : ''}   `}
+							{`${r.off ? '✕' : '●'} ${r.id}`}
+							{/* Its learned score as a bar once it has a record; a route that is off is red instead. */}
+							{r.runs && !r.off ? <Text color={r.score >= 0.5 ? c.ok : c.warn}>{` ${bar(r.score, 1, 4).padEnd(4)}`}</Text> : null}
+							{`${r.runs ? ` ${Math.round(r.score * 100)}%` : ''}   `}
 						</Text>
 					))}
 				</Text>
@@ -167,8 +190,11 @@ export function Tasks({ tasks, height, t, planning, top = 0, selected, icons = '
  * Running agents in `height` rows: two rows each (route, then what it is doing) when they
  * fit, one row each when not, and a count for the rest.
  */
-export function Workers({ workers, t, height }: { workers: WorkerView[]; t: number; height: number }) {
+export function Workers({ workers, t, height, now = Date.now() }: { workers: WorkerView[]; t: number; height: number; now?: number }) {
 	const room = Math.max(1, height - 1);
+	// The last minute in 5 s slots, ending on a slot boundary: the line changes when an event lands or a slot turns, not every frame.
+	const end = Math.ceil(now / 5000) * 5000;
+	const pulse = (w: WorkerView) => sparkline(bins(w.beats ?? [], end - 60_000, end, 12), 12);
 	const roomy = workers.length * 2 <= room;
 	const fit = roomy ? workers.length : workers.length <= room ? workers.length : Math.max(0, room - 1);
 	return (
@@ -183,7 +209,7 @@ export function Workers({ workers, t, height }: { workers: WorkerView[]; t: numb
 				// Planning stages have no task id: a brainstormer shows its angle and round.
 				const label = w.task.startsWith('ideas:') ? w.title : reviewing ? `review ${w.task}` : w.task;
 				// An agent that has said nothing for a while says so; past two minutes it may be stuck.
-				const quiet = Date.now() - (w.lastAt ?? w.started);
+				const quiet = now - (w.lastAt ?? w.started);
 				return (
 					<Box key={w.key} flexDirection="column">
 						<Text wrap="truncate-end">
@@ -191,9 +217,10 @@ export function Workers({ workers, t, height }: { workers: WorkerView[]; t: numb
 							<Text color={c.textDim}>{` ${roleOf(w.key)}`}</Text>
 							<Text color={c.textBright}>{` ${label} `}</Text>
 							<Text color={c.accentDeep}>{w.route}</Text>
+							<Text color={c.accent}>{`  ${pulse(w)}`}</Text>
 							{drifted ? <Text color={c.warming}>{` ⇅ ${w.model}`}</Text> : null}
 							{quiet > 30_000 ? <Text color={quiet > 120_000 ? c.warn : c.textFaint}>{`  quiet ${elapsed(quiet)}`}</Text> : null}
-							{roomy ? <Text color={c.textDim}>{`  ${elapsed(Date.now() - w.started)} · ${w.tools} tools${w.cost ? ` · $${w.cost.toFixed(2)}` : ''}`}</Text> : <Text color={c.textFaint}>{`  ${doing}`}</Text>}
+							{roomy ? <Text color={c.textDim}>{`  ${elapsed(now - w.started)} · ${w.tools} tools${w.cost ? ` · $${w.cost.toFixed(2)}` : ''}`}</Text> : <Text color={c.textFaint}>{`  ${doing}`}</Text>}
 						</Text>
 						{roomy ? <Text color={c.textFaint} wrap="truncate-end">{`  └ ${doing}`}</Text> : null}
 					</Box>
@@ -287,6 +314,74 @@ export function Learning({ learning, height }: { learning: LearningStore; height
 	);
 }
 
+export interface ReviewRow {
+	task: StoredTask;
+	next?: string;
+	/** Its newest kept patch in one line: totals and the files it touched. */
+	patch?: string;
+}
+
+/**
+ * /review: every task that needs you, each with why, the next step and what its patch touched;
+ * `at` is the picked one, kept in view. /task and Enter act on it.
+ */
+export function Review({ rows, at, height }: { rows: ReviewRow[]; at: number; height: number }) {
+	const lines: { key: string; row: number; el: ReactElement }[] = [];
+	rows.forEach((r, i) => {
+		const t = r.task;
+		const sel = i === at;
+		const add = (key: string, el: ReactElement) => lines.push({ key: `${t.id}:${key}`, row: i, el });
+		add(
+			'head',
+			<Text wrap="truncate-end">
+				<Text color={sel ? c.accent : c.line}>{sel ? '▌' : ' '}</Text>
+				<Text color={c.warn}>{t.status === 'blocked' ? 'blocked ' : 'review  '}</Text>
+				<Text color={c.textDim}>{`${t.id} `}</Text>
+				<Text color={sel ? c.textBright : c.text} bold={sel}>{t.title}</Text>
+				<Text color={c.textFaint}>{`  ${t.type} ${t.tier}`}</Text>
+			</Text>,
+		);
+		if (t.reason) add('why', <Text color={c.textDim} wrap="truncate-end">{`   why  ${t.reason.replace(/^jarvis-code: /, '')}`}</Text>);
+		if (r.next) add('next', <Text color={c.accentLift} wrap="truncate-end">{`   next ${r.next}`}</Text>);
+		add('patch', <Text color={c.textFaint} wrap="truncate-end">{`   patch ${r.patch ?? 'none kept'}`}</Text>);
+	});
+	const room = Math.max(1, height - 1);
+	// Keep the picked task's rows in view: start at its first row once it would fall below the window.
+	const first = lines.findIndex((l) => l.row === at);
+	const start = Math.max(0, Math.min(first < 0 ? 0 : first + 4 > room ? first - Math.max(0, room - 4) : 0, lines.length - room));
+	return (
+		<Box flexDirection="column" flexGrow={1}>
+			<Label text="review" right={rows.length ? `${at + 1} of ${rows.length} need you · ↑↓ pick · Enter its patch · /task approve|retry|drop · Esc` : 'Esc to close'} />
+			{rows.length ? null : <Text color={c.ok}>nothing needs you here</Text>}
+			{lines.slice(start, start + room).map((l) => (
+				<Box key={l.key}>{l.el}</Box>
+			))}
+		</Box>
+	);
+}
+
+/** /find's results: each task that mentions the text, its status, and where it matched. */
+export function Found({ text, found, height }: { text: string; found: ReturnType<Project['find']>; height: number }) {
+	const room = Math.max(1, height - 1);
+	const fit = found.length <= room ? found.length : room - 1;
+	const tone = (s: string) => (s === 'done' ? c.ok : s === 'blocked' || s === 'review' ? c.warn : s === 'active' ? c.accent : c.textDim);
+	return (
+		<Box flexDirection="column" flexGrow={1}>
+			<Label text={`find ${text}`} right={`${found.length} task${found.length === 1 ? '' : 's'} · Esc to close`} />
+			{found.length ? null : <Text color={c.textFaint}>{`nothing here mentions "${text}"`}</Text>}
+			{found.slice(0, fit).map(({ task: t, where }) => (
+				<Text key={t.id} wrap="truncate-end">
+					<Text color={tone(t.status)}>{t.status.padEnd(9)}</Text>
+					<Text color={c.textDim}>{`${t.id} `}</Text>
+					<Text color={c.text}>{t.title}</Text>
+					<Text color={c.textFaint}>{`  in ${where.join(', ')}`}</Text>
+				</Text>
+			))}
+			{fit < found.length ? <Text color={c.textFaint}>{`  … ${found.length - fit} more: jarvis-code find ${text}`}</Text> : null}
+		</Box>
+	);
+}
+
 export function Reports({ reports, height }: { reports: ReturnType<Project['reports']>; height: number }) {
 	const room = Math.max(1, height - 1);
 	const fit = reports.length <= room ? reports.length : room - 1;
@@ -307,12 +402,13 @@ export function Reports({ reports, height }: { reports: ReturnType<Project['repo
 }
 
 /** The newest `height` lines, or, `back` lines up, older ones (0 follows the run live). */
-export function Feed({ activity, v, height, back = 0 }: { activity: Activity[]; v: View; height: number; back?: number }) {
+export function Feed({ activity, v, height, back = 0, only }: { activity: Activity[]; v: View; height: number; back?: number; only?: string }) {
 	const want = height + back;
 	const lines: { key: string; el: ReactElement }[] = [];
 	for (let i = activity.length - 1; i >= 0 && lines.length < want; i--) {
 		const a = activity[i];
-		if (!visible(a, v)) continue;
+		// `only`: one task's lines (its workers, reviews and checks), for following one agent.
+		if (!visible(a, v) || (only && a.task !== only)) continue;
 		const [icon, key] = kindMark(a.kind, v.icons);
 		const color = c[key];
 		const detail =
@@ -342,7 +438,7 @@ export function Feed({ activity, v, height, back = 0 }: { activity: Activity[]; 
 	const shows = [v.showDiffs && 'diffs', v.showTools && 'tools', v.showText && 'messages'].filter(Boolean).join(' · ') || 'completions';
 	return (
 		<Box flexDirection="column" flexGrow={1}>
-			<Label text="activity" right={skip ? `${skip} lines back · End for live` : shows} />
+			<Label text="activity" right={`${only ? `${only} only · Esc for all · ` : ''}${skip ? `${skip} lines back · End for live` : shows}`} />
 			{page.length ? null : <Text color={c.textFaint}>waiting for the first event</Text>}
 			{page.reverse().map((l) => (
 				<Box key={l.key}>{l.el}</Box>

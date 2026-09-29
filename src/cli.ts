@@ -6,16 +6,21 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { agentEnabled, DEFAULTS, loadConfig, merge, normalize, onPath, paths, trustProject, untrustProject, type Config } from './config.js';
-import { intentFile, intentSummary, resetIntent } from './intent.js';
+import { intentFile, intentSummary, recordIntent, resetIntent } from './intent.js';
 import { Learning, routesFor, score } from './learn.js';
 import { Orchestrator } from './orchestrator.js';
 import { improveGoal, nextRound } from './pipeline.js';
+import { serve } from './mcp.js';
+import { ask } from './ask.js';
+import { issueGoal } from './issue.js';
 import { attachPlain } from './plain.js';
-import { install, installed, PLUGIN_DIR, ROOT, TARGETS, uninstall, type Target } from './plugin.js';
+import { install, installed, mcpInstalled, PLUGIN_DIR, ROOT, TARGETS, uninstall, type Target } from './plugin.js';
 import { RunManager, demoConfig, runDetached, stopElsewhere, type Run } from './runs.js';
 import { BULK, decideTask, DECISIONS, listStored, nextStep, Project, TYPES, type Decision, type Status, type StoredTask } from './store.js';
 import { MemorySource, StoreSource, type TaskSource } from './tasks.js';
+import { undo, undoRun } from './worktree.js';
 import { colorDepth, paint, palette } from './theme.js';
+import { sparkline } from './tui/charts.js';
 
 const VERSION = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version as string;
 
@@ -24,15 +29,25 @@ const HELP = `jarvis-code ${VERSION} — orchestration for Claude Code, Codex, O
 Usage
   jarvis-code                     the cockpit: every project, runs, a prompt for goals and /commands
   jarvis-code "<goal>"            plan the goal into tasks, then work them (opens the cockpit on the run)
+  jarvis-code plan "<goal>"       plan the goal into this project's queue and stop: see the tasks and the
+                                  estimate, change them (task drop|defer|bump), then \`work\` runs them
   jarvis-code work                work this project's open tasks, no planning
+  jarvis-code issue N             plan and work GitHub issue #N (read with gh; nothing is posted back)
   jarvis-code improve [focus]     find and make the most valuable improvements here (brainstormed first),
                                   in rounds that each build on the last until one lands too little
   jarvis-code demo                simulated agents: see the TUI, learning and re-upgrades (no API calls)
   jarvis-code status              the queue, the agents and their learned health
   jarvis-code stop                end this project's background or CLI run
   jarvis-code tasks [--all]       this project's tasks (--all includes done and dropped)
+  jarvis-code history [--json]    this project's finished runs: cost and success across them, newest first
+  jarvis-code find <text>         every task here that mentions the text or whose patch touched a matching file
+  jarvis-code ask "<question>"    a read-only agent answers about this project's runs, tasks or code
+  jarvis-code digest [days] [--json]  every project's runs over the last days (default 7), for a standup
+  jarvis-code mcp                 an MCP server (stdio) for Claude Code, Codex and OpenCode sessions: status, tasks, queue a goal
   jarvis-code task add "<title>" [--type T] [--tier S|M|L] [--ac "<done when> :: <verify cmd>"]...
   jarvis-code task show|retry|defer|drop|approve ID|blocked|review [why]
+  jarvis-code task undo ID|run    take a landed task's changes back out of the tree and defer it;
+                                  run: every task the newest run landed (again: the run before)
   jarvis-code status --all [--json]   every project's queue (JSON for scripts)
   jarvis-code learn [reset [KEY]] what was learned about routes and tools; forget it
   jarvis-code intent [reset]      what you asked for and turned down, across projects (redacted); forget it
@@ -165,8 +180,34 @@ async function main(argv: string[]) {
 			return stopCmd(cwd);
 		case 'tasks':
 			return tasksCmd(cwd, !!f.all);
+		case 'history':
+			return historyCmd(cwd, !!f.json);
+		case 'digest':
+			return digestCmd(rest[0], !!f.json);
+		case 'ask': {
+			const question = rest.join(' ').trim();
+			if (!question) die('ask needs a question about this project: jarvis-code ask "why did T-0003 fail?"');
+			try {
+				const { answer, route, cost } = await ask(config, new Learning(config.learning), cwd, question);
+				say(answer);
+				return say(tone(`\n${route}${cost ? ` · $${cost.toFixed(2)}` : ''}`, 'textDim'));
+			} catch (e) {
+				die((e as Error).message, 1);
+			}
+		}
+		case 'find': {
+			const text = rest.join(' ').trim();
+			if (!text) die('find needs some text: a word, a file name, part of a title');
+			const found = Project.open(cwd)?.find(text) ?? [];
+			if (!found.length) return say(`nothing here mentions "${text}"`);
+			for (const { task: t, where } of found) say(`${taskLine(t)}${tone(`  · ${t.status} · in ${where.join(', ')}`, 'textDim')}`);
+			return;
+		}
+		case 'mcp':
+			// stdout carries the protocol from here on: nothing else may print to it.
+			return serve(process.stdin, process.stdout, cwd, process.env, VERSION);
 		case 'task':
-			return taskCmd(cwd, rest, { type: f.type, tier: f.tier, ac: f.ac, intent: config.intent });
+			return taskCmd(cwd, rest, { type: f.type, tier: f.tier, ac: f.ac, intent: config.intent, learning: config.learning });
 		case 'learn':
 			return learn(config, rest);
 		case 'intent':
@@ -186,6 +227,25 @@ async function main(argv: string[]) {
 			if (f.detach) return detach(cwd, argv, f.tasks);
 			if (tui) return cockpit(config, cwd, overrides, (m) => m.improve(cwd, { focus, ...config.improve }));
 			return run(normalize(merge(config, deep)), cwd, goal, f.tasks, { focus });
+		}
+		case 'issue': {
+			let goal: string;
+			try {
+				goal = await issueGoal(cwd, rest[0] ?? '');
+			} catch (e) {
+				die((e as Error).message, 1);
+			}
+			// A background run reads the issue again itself: the argv it gets is `issue N`.
+			if (f.detach) return detach(cwd, argv, f.tasks);
+			if (tui) return cockpit(config, cwd, overrides, (m) => m.start(cwd, { goal, memory: f.tasks === 'memory' }));
+			return run(config, cwd, goal, f.tasks);
+		}
+		case 'plan': {
+			const goal = rest.join(' ').trim();
+			if (!goal) die('plan needs a goal: jarvis-code plan "<goal>"');
+			if (f.tasks === 'memory') die('plan keeps its tasks in the task store: drop --tasks memory');
+			if (tui) return cockpit(config, cwd, overrides, (m) => m.start(cwd, { goal, planOnly: true }));
+			return run(config, cwd, goal, f.tasks, undefined, true);
 		}
 		case 'work':
 		case 'run':
@@ -245,7 +305,7 @@ function source(config: Config, cwd: string, kind: string | undefined): TaskSour
 }
 
 /** `improve`: after the first run, more rounds of improveGoal, each building on what the last closed, until nextRound ends them. */
-async function run(config: Config, cwd: string, goal: string | undefined, tasks: string | undefined, improve?: { focus?: string }) {
+async function run(config: Config, cwd: string, goal: string | undefined, tasks: string | undefined, improve?: { focus?: string }, planOnly = false) {
 	if (!goal && tasks === 'memory') die('nothing to work: the memory queue starts empty, give a goal');
 	const src = source(config, cwd, tasks);
 	// Workers load this package's plugin per session unless it is installed for good.
@@ -256,14 +316,15 @@ async function run(config: Config, cwd: string, goal: string | undefined, tasks:
 	} catch (e) {
 		// A goal for a busy project waits for its run; `work` has nothing to wait with.
 		const held = project?.running();
-		if (goal && held) return say(`${tone('jarvis-code', 'accent')}: queued #${project!.enqueue(goal)} in ${project!.meta.name}: runs after the current run (pid ${held.pid})`);
+		// A plan-only goal is not queued: its turn would work the plan it was meant to show.
+		if (goal && held && !planOnly) return say(`${tone('jarvis-code', 'accent')}: queued #${project!.enqueue(goal)} in ${project!.meta.name}: runs after the current run (pid ${held.pid})`);
 		die((e as Error).message, 1);
 	}
 	try {
 		// Then the improve rounds and the goals queued while it ran, each with a fresh orchestrator, until one stops or fails.
 		let code = 0;
 		for (let next = goal, round = 1; ; round++) {
-			const o = new Orchestrator(config, src, new Learning(config.learning), cwd, { pluginDir });
+			const o = new Orchestrator(config, src, new Learning(config.learning), cwd, { pluginDir, planOnly });
 			code = Math.max(code, await drive(o, config, next));
 			const s = o.snapshot();
 			if (improve) {
@@ -280,8 +341,10 @@ async function run(config: Config, cwd: string, goal: string | undefined, tasks:
 				say(`${tone('jarvis-code', 'accent')}: improve ended after round ${round} (${end}): ${why}`);
 				improve = undefined;
 			}
-			if (s.phase === 'stopped' || s.error || !(next = project?.nextGoal())) break;
+			if (planOnly || s.phase === 'stopped' || s.error || !(next = project?.nextGoal())) break;
 		}
+		// The point of a plan-only run: the queue it made, to read before `work`.
+		if (planOnly && project) tasksCmd(cwd, false);
 		process.exitCode = code;
 	} finally {
 		project?.unlock();
@@ -409,6 +472,46 @@ const MARK: Record<Status, [string, keyof typeof palette]> = {
 
 const taskLine = (t: StoredTask) => `  ${tone(...MARK[t.status])} ${t.id} ${t.type} ${t.tier}  ${t.title}${t.reason ? tone(`  ${t.reason}`, 'textDim') : ''}`;
 
+/** Every project's runs over the last `days` days (default 7), with what waits for you now: one summary for a standup. */
+function digestCmd(daysArg: string | undefined, json: boolean) {
+	const days = daysArg === undefined ? 7 : Number(daysArg);
+	if (!(days > 0)) die('digest [days]: a number of days above 0');
+	const since = new Date(Date.now() - days * 86_400_000).toISOString();
+	const rows = listStored()
+		.map((m) => {
+			const p = new Project(m.path);
+			const runs = p.history().filter((r) => r.at >= since);
+			const s = p.summary();
+			return { project: m.name, path: m.path, runs: runs.length, done: runs.reduce((a, r) => a + r.done, 0), total: runs.reduce((a, r) => a + r.total, 0), cost: runs.reduce((a, r) => a + r.cost, 0), minutes: runs.reduce((a, r) => a + r.minutes, 0), needsYou: s.blocked + s.review, goals: runs.map((r) => r.goal).filter(Boolean) as string[] };
+		})
+		.filter((r) => r.runs || r.needsYou);
+	if (json) return say(JSON.stringify({ days, since, projects: rows }, null, 2));
+	if (!rows.length) return say(`no jarvis-code runs in the last ${days} day${days === 1 ? '' : 's'}`);
+	say(tone(`jarvis-code, the last ${days} day${days === 1 ? '' : 's'}`, 'textDim'));
+	for (const r of rows) {
+		say(`${tone(r.project, 'text')}  ${r.runs} run${r.runs === 1 ? '' : 's'} · ${r.done}/${r.total} tasks done · $${r.cost.toFixed(2)} · ${Math.round(r.minutes)} min${r.needsYou ? tone(` · ${r.needsYou} need you`, 'warn') : ''}`);
+		for (const g of r.goals.slice(0, 5)) say(tone(`  - ${g.split('\n')[0].slice(0, 100)}`, 'textDim'));
+	}
+	const sum = (k: 'runs' | 'done' | 'total' | 'cost' | 'minutes') => rows.reduce((a, r) => a + r[k], 0);
+	say(tone(`${rows.length} project${rows.length === 1 ? '' : 's'} · ${sum('runs')} runs · ${sum('done')}/${sum('total')} tasks done · $${sum('cost').toFixed(2)} · ${Math.round(sum('minutes'))} min`, 'textDim'));
+}
+
+/** This project's finished runs, newest first, with cost and success across them as sparklines. */
+function historyCmd(cwd: string, json: boolean) {
+	const runs = Project.open(cwd)?.history() ?? [];
+	if (json) return say(JSON.stringify(runs, null, 2));
+	if (!runs.length) return say('no finished runs here yet: each run leaves a line when it ends');
+	const old = [...runs].reverse();
+	const tasks = runs.reduce((s, r) => s + r.total, 0);
+	const done = runs.reduce((s, r) => s + r.done, 0);
+	say(`${tone('cost   ', 'textDim')} ${tone(sparkline(old.map((r) => r.cost), 40), 'warming')}  $${runs.reduce((s, r) => s + r.cost, 0).toFixed(2)} in ${runs.length} run${runs.length === 1 ? '' : 's'}`);
+	say(`${tone('success', 'textDim')} ${tone(sparkline(old.map((r) => (r.total ? r.done / r.total : 0)), 40, 1), 'ok')}  ${tasks ? Math.round((done / tasks) * 100) : 0}% of ${tasks} tasks done`);
+	for (const r of runs) {
+		const stuck = r.blocked + r.review;
+		say(`${tone(r.at.slice(0, 16).replace('T', ' '), 'textFaint')}  ${tone(`${r.done}/${r.total}`.padStart(5), stuck ? 'warn' : 'text')}  $${r.cost.toFixed(2).padStart(6)}  ${`${r.minutes}m`.padStart(6)}  ${r.stopped ? tone('stopped ', 'danger') : ''}${r.goal ?? 'the open queue'}`);
+	}
+}
+
 function tasksCmd(cwd: string, all: boolean) {
 	const project = Project.open(cwd);
 	if (!project) return say('no tasks here yet: give jarvis-code a goal to plan some, or `jarvis-code task add`');
@@ -419,8 +522,18 @@ function tasksCmd(cwd: string, all: boolean) {
 	say(tone(`\n${s.planned + s.active} open · ${s.blocked} blocked · ${s.review} to review · ${s.deferred} deferred · ${s.done} done`, 'textDim'));
 }
 
-function taskCmd(cwd: string, args: string[], f: { type?: string; tier?: string; ac?: string[]; intent: boolean }) {
+async function taskCmd(cwd: string, args: string[], f: { type?: string; tier?: string; ac?: string[]; intent: boolean; learning: Config['learning'] }) {
 	const [verb, id, ...why] = args;
+	if (verb === 'undo') {
+		const project = Project.open(cwd);
+		if (!project || !id) die('task undo needs the id of a task that landed here, or `run` for the newest run');
+		try {
+			const teach = { learning: new Learning(f.learning), ...(f.intent && { intent: recordIntent }) };
+			return say(await (id.toLowerCase() === 'run' ? undoRun(project, cwd, teach) : undo(project, cwd, id, teach)));
+		} catch (e) {
+			die((e as Error).message, 1);
+		}
+	}
 	if (verb === 'add') {
 		const title = args.slice(1).join(' ').trim();
 		if (!title) die('task add needs a title');
@@ -434,7 +547,7 @@ function taskCmd(cwd: string, args: string[], f: { type?: string; tier?: string;
 		return say(`${tone('+', 'ok')} ${t.id} ${t.title}${acs.some((a) => a.verify) ? '' : tone('  (no verify command: a worker finishing it goes to review)', 'textDim')}`);
 	}
 	if (verb !== 'show' && !(verb in DECISIONS))
-		die(verb ? `unknown task verb "${verb}" (add, show, retry, defer, drop, approve); to plan a goal, quote it: jarvis-code "task ${args.join(' ')}"` : 'task needs a verb: add, show, retry, defer, drop or approve');
+		die(verb ? `unknown task verb "${verb}" (add, show, retry, defer, drop, approve, undo); to plan a goal, quote it: jarvis-code "task ${args.join(' ')}"` : 'task needs a verb: add, show, retry, defer, drop or approve');
 	const project = Project.open(cwd);
 	if (!project) die(`no task ${id ?? ''} here`);
 	const bulk = verb !== 'show' && !!id && (BULK as readonly string[]).includes(id.toLowerCase());
@@ -544,7 +657,7 @@ function pluginCmd(args: string[]) {
 	const targets = which ? [which as Target] : TARGETS;
 	for (const t of targets) if (!TARGETS.includes(t)) die(`unknown agent "${t}" (claude, codex, opencode)`);
 	if (sub === 'status') {
-		for (const t of targets) say(`  ${installed[t]() ? tone('●', 'ok') + ` ${t}: installed` : tone('○', 'textFaint') + ` ${t}: not installed`}`);
+		for (const t of targets) say(`  ${installed[t]() ? tone('●', 'ok') + ` ${t}: installed` : tone('○', 'textFaint') + ` ${t}: not installed`}${mcpInstalled[t]() ? tone('  · MCP server', 'textDim') : ''}`);
 		return say(`\nplugin: ${PLUGIN_DIR}\n(Claude Code workers get it per session with --plugin-dir when it is not installed.)`);
 	}
 	if (sub !== 'install' && sub !== 'uninstall') die(`plugin ${sub}: expected install, uninstall or status`);
@@ -584,6 +697,8 @@ function doctor(config: Config, cwd: string, sources: string[]) {
 	for (const t of TARGETS) {
 		const agent = Object.values(config.agents).find((a) => a.kind === t && agentEnabled(a));
 		if (!agent) continue;
+		if (mcpInstalled[t]()) say(`${tone('✓', 'ok')} ${t}: the jarvis-code MCP server is registered (status, tasks, queue_goal…)`);
+		else if (t !== 'claude') warn(`${t}: no jarvis-code MCP server: \`jarvis-code plugin install ${t}\` lets its sessions see the queue and hand jarvis-code goals`);
 		if (installed[t]()) say(`${tone('✓', 'ok')} ${t} plugin installed`);
 		else if (t === 'claude') say(`${tone('✓', 'ok')} claude plugin: loaded per session from ${PLUGIN_DIR}`);
 		else warn(`${t} plugin not installed: learned tool blocking is off for ${t} (\`jarvis-code plugin install ${t}\`)`);

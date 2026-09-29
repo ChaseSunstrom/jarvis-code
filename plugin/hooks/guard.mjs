@@ -2,9 +2,9 @@
 // Pure: it reads the environment jarvis-code sets on the worker and answers allow or deny.
 
 /** `jarvis-code` verbs that only read: anything else plans, runs or changes the queue. */
-const READ_ONLY = /^(status|tasks|learn|doctor|config|help|--help|-h|--version|-v)$/;
+const READ_ONLY = /^(status|tasks|history|find|digest|learn|doctor|config|help|--help|-h|--version|-v)$/;
 /** Verbs that change state or start a run, for either name. `jc` is also another tool's name (JSON conversion), so for it only these count. */
-const STATE_VERBS = /^(run|work|demo|task|plugin|learn|config)$/;
+const STATE_VERBS = /^(run|work|plan|improve|issue|stop|ask|demo|task|plugin|learn|config)$/;
 /** Words that run the word after them as the command (`env jc …`, `then jc …`). */
 const PREFIXES = /^(env|command|exec|nohup|time|sudo|npx|then|do|else|if|while|until|!)$/;
 

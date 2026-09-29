@@ -176,11 +176,14 @@ const [, middle, last] = thirds(burst);
 levels('burst', middle, last, ['middle third', 'last third']);
 
 // The quiet phase: a demo at normal pace, its dashboard open, so the reactor animates and the
-// cockpit draws at ui.fps. A demo that ends early is followed by the next, focused the same way.
+// cockpit draws at ui.fps, stepping through the run's views with Tab. A demo that ends early is followed by the next, focused the same way.
 const screen = new Stdout();
 let run = manager.startDemo(false);
 const focused = (run) => createElement(Cockpit, { key: run.id, manager, config, depth: 'truecolor', focus: run, cwd: root });
-const calm = render(focused(run), inkOptions(screen, new Stdin()));
+const calmIn = new Stdin();
+const calm = render(focused(run), inkOptions(screen, calmIn));
+// Every view of the run (graph, tree, timeline, stats, ideas) takes its turn while it animates.
+const cycle = setInterval(() => calmIn.type('\t'), 5000);
 const onFinished = (r) => {
 	if (r !== run) return;
 	run = manager.startDemo(false);
@@ -189,6 +192,7 @@ const onFinished = (r) => {
 manager.on('finished', onFinished);
 const quiet = await sample(ANIMATE_SECONDS, () => `demo ${run.id} ${run.o.snapshot().reactor}  frames ${screen.frames}`);
 manager.off('finished', onFinished);
+clearInterval(cycle);
 calm.unmount();
 await manager.stopAll();
 const measures = performance.getEntriesByType('measure').length;

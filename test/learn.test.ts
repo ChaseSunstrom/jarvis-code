@@ -64,7 +64,8 @@ test('when every route is off the one cooling down first is probed, not a stall'
 });
 
 test('subagents and MCP tools are learned per orchestrator; core tools never are', () => {
-	const { l, file } = fresh();
+	// The reload reads the fixture clock too: on the real one the 24 h cooldown ran out on 2026-09-28.
+	const { l, file, now } = fresh();
 	for (let i = 0; i < 3; i++) {
 		l.recordTool('claude', 'Agent(Explore)', false);
 		l.recordTool('claude', 'Bash', false);
@@ -75,7 +76,7 @@ test('subagents and MCP tools are learned per orchestrator; core tools never are
 	assert.equal(learnable('mcp__docs__search'), true);
 	assert.equal(learnable('WebFetch', ['WebFetch']), false);
 	l.save();
-	assert.deepEqual(new Learning(DEFAULTS.learning, file).blockedTools('claude'), ['Agent(Explore)']);
+	assert.deepEqual(new Learning(DEFAULTS.learning, file, () => now.t).blockedTools('claude'), ['Agent(Explore)']);
 });
 
 test('learning off records nothing', () => {

@@ -10,6 +10,7 @@ with the task's own checks and keeps the queue, evidence and lessons in its own 
 work instead of doing a large change turn by turn.
 
 - Start a goal (non-interactive, for use from here): `jarvis-code "<goal>" --plain`
+- Plan a goal into the queue without working it, to review the tasks first: `jarvis-code plan "<goal>" --plain`
 - Work this project's open tasks without planning: `jarvis-code work --plain`
 - Where things stand: `jarvis-code status`, `jarvis-code tasks`, `jarvis-code task show ID`
 - What it has learned (routes and tools it switched off): `jarvis-code learn`
@@ -18,6 +19,12 @@ work instead of doing a large change turn by turn.
   `/jarvis-code:brainstorm <goal>`, or `--planning deep`
 - Follow-ups workers found out of scope are kept deferred: `jarvis-code tasks --all`, then
   `jarvis-code task retry ID` to queue one
+
+With the jarvis-code MCP server (it comes with this plugin; `jarvis-code plugin install codex|opencode`
+adds it to those agents), use its tools instead of shelling out: `status`, `tasks`, `task_show`,
+`history` to look; `queue_goal` to hand it a goal (it starts a background run, or queues the goal
+behind the one going), `add_task` and `tell` (a note for a task's next attempt) to steer.
+`/jarvis-code:queue <goal>` does the first.
 
 Run it in the background for long goals and read its summary line when it exits: exit 0 means
 every task closed; 1 means some were blocked or need review (listed in the output).

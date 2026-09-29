@@ -31,6 +31,11 @@ const IDEAS_MARKER = 'JARVIS-CODE IDEAS';
 const REVIEW_MARKER = 'JARVIS-CODE REVIEW';
 const CRITIQUE_MARKER = 'JARVIS-CODE CRITIQUE';
 const COVERAGE_MARKER = 'JARVIS-CODE COVERAGE';
+const CATEGORIES_MARKER = 'JARVIS-CODE CATEGORIES';
+const BRANCH_MARKER = 'JARVIS-CODE BRANCH';
+const ASK_MARKER = 'JARVIS-CODE ASK';
+/** Words for a tree's ideas, a list per level, so titles never share enough words to be merged as duplicates. */
+const TREE_WORDS = [[], [], ['amber', 'cobalt', 'crimson', 'indigo', 'jade', 'ochre'], ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel'], ['mercury', 'venus', 'mars', 'jupiter', 'saturn', 'neptune', 'uranus', 'pluto'], ['copper', 'nickel', 'chrome', 'zinc', 'tin', 'lead', 'iron', 'gold'], ['oak', 'elm', 'ash', 'fir', 'yew', 'pine', 'larch', 'birch']];
 const argv = process.argv.slice(2);
 const stream = argv.includes('--input-format');
 const argOf = (name: string) => {
@@ -110,7 +115,27 @@ async function work(prompt: string): Promise<{ ok: boolean; text: string }> {
 	if (process.env.JC_DEMO_LOG) appendFileSync(process.env.JC_DEMO_LOG, JSON.stringify(noTools ? `[no tools] ${prompt}` : prompt) + '\n');
 	const broken = (stage: string) => (process.env.JC_DEMO_BREAK ?? '').split(',').includes(stage);
 	if (prompt.includes(PROMPT_MARKER) && broken('prompt')) return { ok: true, text: 'I looked around; the goal seems fine.' };
-	if (prompt.includes(IDEAS_MARKER) && broken('ideas')) return { ok: true, text: 'Some thoughts: make it faster.' };
+	if ((prompt.includes(IDEAS_MARKER) || prompt.includes(CATEGORIES_MARKER) || prompt.includes(BRANCH_MARKER)) && broken('ideas')) return { ok: true, text: 'Some thoughts: make it faster.' };
+	if (prompt.includes(ASK_MARKER)) {
+		await tool('Read', { file_path: 'README.md' });
+		const question = prompt.match(/<<<QUESTION\n([\s\S]*?)\nQUESTION>>>/)?.[1] ?? '';
+		return { ok: true, text: `You asked: ${question}\n\nFrom the record, T-0001 closed on its first attempt and nothing is blocked. ${'The reports and the ledger agree on this; the loader lives in src/config.ts. '.repeat(3)}` };
+	}
+	if (prompt.includes(CATEGORIES_MARKER)) {
+		await tool('Read', { file_path: 'README.md' });
+		const ideas = ['Interface', 'Reliability', 'Speed'].map((title, k) => ({ title, why: `the ${title.toLowerCase()} of src/config.ts`, value: 5 - k }));
+		return { ok: true, text: JSON.stringify({ ideas }) };
+	}
+	if (prompt.includes(BRANCH_MARKER)) {
+		await tool('Read', { file_path: 'src/config.ts' });
+		const [, cat = 'Area', level = '2'] = prompt.match(/Category: (.*?)\. Level (\d+) of/) ?? [];
+		const parents = (prompt.split('numbered:\n')[1] ?? '').split('\n\n')[0].split('\n').filter((l) => /^\d+\. /.test(l)).length;
+		// Level 2 grows 3 broad ideas from the category; deeper levels 2 per parent, best first.
+		const per = Number(level) === 2 ? 3 : 2;
+		const pool = TREE_WORDS[Number(level)] ?? TREE_WORDS[2];
+		const ideas = Array.from({ length: Math.max(1, parents) * per }, (_, i) => ({ parent: Math.floor(i / per) + 1, title: `${cat} ${pool[i % pool.length]}`, why: 'it helps (src/config.ts)', effort: 'S', value: 5 - (i % per) }));
+		return { ok: true, text: JSON.stringify({ ideas }) };
+	}
 	if (prompt.includes(CRITIQUE_MARKER)) {
 		await tool('Read', { file_path: 'src/config.ts' });
 		if (broken('critique')) return { ok: true, text: 'They all look reasonable to me.' };

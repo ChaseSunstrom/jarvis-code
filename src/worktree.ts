@@ -1,8 +1,10 @@
 import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { basename, isAbsolute, join } from 'node:path';
 import { changes, git, snapshot } from './review.js';
+import type { Learning } from './learn.js';
+import type { Project } from './store.js';
 
 /**
  * One attempt's own working tree, for workers running side by side. It starts from the main
@@ -116,3 +118,63 @@ function apply(cwd: string, patch: string, reverse = false): Promise<string | un
 export const land = (cwd: string, patch: string) => apply(cwd, patch);
 /** Take a landed patch back out (its checks failed once merged); the error when it can't be. */
 export const unland = (cwd: string, patch: string) => apply(cwd, patch, true);
+
+/**
+ * Take a landed task back out: reverse-apply its newest passing attempt's kept patch to `cwd`
+ * (all or nothing), then defer the task so no run redoes it by itself. Throws with why when
+ * there is nothing to undo or the patch no longer reverses (a later change touched the lines).
+ */
+export async function undo(project: Project, cwd: string, id: string, teach: { learning?: Learning; intent?: (e: { kind: 'dropped'; text: string; project: string }) => void } = {}): Promise<string> {
+	const t = project.get(id.toUpperCase());
+	if (!t) throw new Error(`no task ${id}`);
+	if (t.status === 'active') throw new Error(`${t.id} is being worked right now: stop the run first`);
+	// A worker without a worktree edits this same tree: reversing a patch under it could tear both.
+	if (project.running()) throw new Error('a run is going in this project: stop it first');
+	const landed = t.attempts.findLast((a) => a.ok && a.patch);
+	const file = landed?.patch;
+	let patch = '';
+	try {
+		patch = file ? readFileSync(file, 'utf8') : '';
+	} catch {
+		/* the kept file is gone */
+	}
+	if (!patch.trim()) throw new Error(`no landed patch kept for ${t.id}: nothing to undo`);
+	const err = await unland(cwd, patch);
+	if (err) throw new Error(`could not take ${t.id}'s changes back out (nothing was changed): ${err.split('\n')[0]}`);
+	project.setStatus(t.id, 'deferred', `undone: its changes were taken back out (${new Date().toISOString().slice(0, 16).replace('T', ' ')})`);
+	project.log({ event: 'undo', id: t.id, patch: file });
+	// You took the work back: the route that did it is charged, overall and for this kind of task,
+	// and the ask counts as turned down, so later plans and dispatch lean away from both.
+	const route = landed!.route;
+	if (teach.learning) {
+		teach.learning.recordRoute(route, false);
+		teach.learning.recordKind(route, t.type, false);
+		teach.learning.save();
+	}
+	teach.intent?.({ kind: 'dropped', text: t.title, project: project.meta.name });
+	return `took ${t.id}'s changes back out of ${basename(cwd)}; it is deferred (\`jarvis-code task retry ${t.id}\` redoes it)${teach.learning ? `; ${route} marked down for it` : ''}`;
+}
+
+/**
+ * Take back every task the newest run still standing landed, newest first, so each patch
+ * reverses onto the tree it left. Called again, it walks back one run at a time. Throws at the
+ * first task that will not reverse, saying which came out: that one and older ones stay.
+ */
+export async function undoRun(project: Project, cwd: string, teach: Parameters<typeof undo>[3] = {}): Promise<string> {
+	const standing = (id: string) => project.get(id)?.status === 'done';
+	const run = project.history().find((r) => r.landed?.some(standing));
+	if (!run) throw new Error('no run here has landed tasks still in the tree');
+	const ids = run.landed!.filter(standing).reverse();
+	const when = run.at.slice(0, 16).replace('T', ' ');
+	const out: string[] = [];
+	for (const id of ids) {
+		try {
+			await undo(project, cwd, id, teach);
+		} catch (e) {
+			const left = ids.slice(out.length);
+			throw new Error(`${out.length ? `took ${out.join(', ')} back out, then ` : ''}stopped at ${id}: ${(e as Error).message}; ${left.join(', ')} ${left.length === 1 ? 'stays' : 'stay'} in the tree`);
+		}
+		out.push(id);
+	}
+	return `took the ${when} run's ${out.length} landed task${out.length === 1 ? '' : 's'} back out of ${basename(cwd)}, newest first: ${out.join(', ')}; each is deferred (\`jarvis-code task retry ID\` redoes one)`;
+}

@@ -14,6 +14,6 @@ Run jarvis-code on it in the background from the project root, passing the goal 
 
 `jarvis-code '<goal>' --planning deep --plain`
 
-It writes a grounded planning prompt, brainstorms in rounds across the configured agents until the ideas run dry, plans the best of them on a different agent, and works the tasks.
+It writes a grounded planning prompt, grows an idea tree across the configured agents (categories, then broad ideas in each, then more specific ideas under the best of them, level by level), has a critic rank the ideas, plans the best of them on a different agent, and works the tasks.
 
-When it exits, summarize in a few lines: the angles and how many ideas each round added (the `Brainstorm round` lines), the tasks planned, which closed, and any blocked or needing review. Point to `jarvis-code tasks --all` for follow-ups the workers found.
+When it exits, summarize in a few lines: the categories and how many ideas each level added (the `Brainstorm tree` and `Brainstorm level` lines), the tasks planned, which closed, and any blocked or needing review. Point to `jarvis-code tasks --all` for follow-ups the workers found.

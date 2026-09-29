@@ -1,6 +1,6 @@
 import { exec } from 'node:child_process';
 import { clean } from './agents/types.js';
-import type { Attempt, Project } from './store.js';
+import type { Attempt, Project, RunRecord } from './store.js';
 
 export interface AC {
 	text: string;
@@ -24,6 +24,8 @@ export interface Task {
 	source?: string;
 	/** Paths the plan said the task will change or create. */
 	files?: string[];
+	/** The worker route the planner picked for it: its first attempt goes there while it is healthy. */
+	route?: string;
 }
 
 /** A task as the planner proposes it; `key`/`depends` link tasks within one plan. */
@@ -38,6 +40,8 @@ export interface PlannedTask {
 	notes?: string;
 	/** Paths (from the repository root) the task will change or create, tests included. */
 	files?: string[];
+	/** The worker route that suits it, one of the configured ones (checked before it is kept). */
+	route?: string;
 }
 
 export interface Check {
@@ -82,6 +86,10 @@ export interface TaskSource {
 	tell?(id: string, text: string): boolean;
 	/** The task's hint as it is now, notes included. */
 	hint?(id: string): string | undefined;
+	/** How the run went, once it ends, where the source keeps history. */
+	history?(r: RunRecord): void;
+	/** Cost (planning left out) and minutes per task across past runs, for an estimate; undefined without history. */
+	pace?(): { usd: number; minutes: number; runs: number } | undefined;
 }
 
 const tail = (s: string, n = 400) => (s.length > n ? '…' + s.slice(-n) : s).trim();
@@ -131,7 +139,7 @@ export class StoreSource implements TaskSource {
 		return this.project
 			.queue()
 			.filter((t) => !skip.has(t.id))
-			.map((t) => ({ id: t.id, title: t.title, type: t.type, tier: t.tier, acs: t.acs, steps: t.steps, brief: t.brief, hint: t.hint, depends: t.depends, source: t.source, files: t.files }));
+			.map((t) => ({ id: t.id, title: t.title, type: t.type, tier: t.tier, acs: t.acs, steps: t.steps, brief: t.brief, hint: t.hint, depends: t.depends, source: t.source, files: t.files, route: t.route }));
 	}
 
 	async add(plan: PlannedTask[], goal?: string): Promise<string[]> {
@@ -226,6 +234,18 @@ export class StoreSource implements TaskSource {
 	hint(id: string): string | undefined {
 		return this.project.get(id)?.hint;
 	}
+
+	history(r: RunRecord): void {
+		this.project.recordRun(r);
+	}
+
+	pace(): { usd: number; minutes: number; runs: number } | undefined {
+		// The newest 20 runs that planned or worked something: an old, different project phase weighs nothing.
+		const runs = this.project.history().filter((r) => r.total > 0).slice(0, 20);
+		const tasks = runs.reduce((s, r) => s + r.total, 0);
+		if (!tasks) return undefined;
+		return { usd: runs.reduce((s, r) => s + Math.max(0, r.cost - r.planning), 0) / tasks, minutes: runs.reduce((s, r) => s + r.minutes, 0) / tasks, runs: runs.length };
+	}
 }
 
 // --- in memory ------------------------------------------------------------------------
@@ -262,6 +282,7 @@ export class MemorySource implements TaskSource {
 				steps: p.steps ?? [],
 				brief: p.notes,
 				files: p.files,
+				...(p.route && { route: p.route }),
 				status: 'open',
 				source,
 				depends: (p.depends ?? []).map((d) => keys.get(d) ?? d),

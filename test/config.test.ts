@@ -121,3 +121,12 @@ test('config keys: pipeline, intent and improve default to the highest setting a
 	for (const minLanded of [-1, 0.5]) assert.throws(() => normalize(merge(DEFAULTS, { improve: { minLanded } })), /improve\.minLanded/);
 	assert.deepEqual(normalize(merge(DEFAULTS, { improve: { rounds: 1, minLanded: 0 }, intent: false })).improve, { rounds: 1, minLanded: 0 });
 });
+
+test('config keys: the tree brainstorm is the default, bounded, and every bound is checked', () => {
+	assert.equal(DEFAULTS.planning.brainstorm, 'tree');
+	assert.deepEqual(DEFAULTS.planning.tree, { depth: 4, categories: 6, breadth: 3, maxCalls: 24 });
+	assert.throws(() => normalize(merge(DEFAULTS, { planning: { brainstorm: 'deep' } })), /planning\.brainstorm: tree or flat/);
+	for (const [k, v] of [['depth', 1], ['depth', 7], ['categories', 1.5], ['breadth', '3'], ['maxCalls', 201]] as const)
+		assert.throws(() => normalize(merge(DEFAULTS, { planning: { tree: { [k]: v } } })), new RegExp(`planning\\.tree\\.${k}: a whole number from [12] to`));
+	assert.deepEqual(normalize(merge(DEFAULTS, { planning: { brainstorm: 'flat', tree: { depth: 2 } } })).planning.tree, { depth: 2, categories: 6, breadth: 3, maxCalls: 24 }, 'one bound set, the rest from the defaults');
+});

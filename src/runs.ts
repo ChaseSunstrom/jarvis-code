@@ -34,6 +34,8 @@ export interface StartOptions {
 	memory?: boolean;
 	/** Config overrides (CLI flags) merged over the project's own config. */
 	overrides?: unknown;
+	/** Plan the goal into the project's queue and stop, without working it or draining the queue. */
+	planOnly?: boolean;
 }
 
 export interface ImproveOptions {
@@ -158,13 +160,15 @@ export class RunManager extends EventEmitter {
 		const busy = this.active().find((r) => r.dir === abs);
 		if (busy) throw new Error(`${basename(abs)} already has a run going (#${busy.id}); /stop it first`);
 		const { config, warnings } = loadConfig(abs, merge(this.base.overrides ?? {}, opts.overrides ?? {}));
+		if (opts.planOnly && (opts.memory || !opts.goal)) throw new Error('plan needs a goal and the task store: a memory queue would forget the plan');
 		const src = await this.source(config, abs, opts.memory);
 		// One run per project across processes too: a CLI or background run may hold it.
 		const project = src instanceof StoreSource ? src.project : undefined;
 		project?.lock({ goal: opts.goal, by: 'cockpit' });
-		const run = this.launch(abs, config, src, opts.goal);
+		const run = this.launch(abs, config, src, opts.goal, this.learning, opts.planOnly);
 		run.warnings = warnings;
-		const after = then ?? ((r: Run, p: Project) => this.drain(abs, r, p, opts));
+		// After a plan-only run the queue waits for you: draining it would work the plan too.
+		const after = then ?? ((r: Run, p: Project) => (opts.planOnly ? Promise.resolve() : this.drain(abs, r, p, opts)));
 		if (project) void run.done.finally(() => project.unlock()).then(() => after(run, project));
 		return run;
 	}
@@ -260,8 +264,8 @@ export class RunManager extends EventEmitter {
 		return new StoreSource(new Project(dir), dir, config.verify.timeoutSec);
 	}
 
-	private launch(dir: string, config: Config, src: TaskSource, goal?: string, learning = this.learning): Run {
-		const o = new Orchestrator(config, src, learning, dir, { pluginDir: claudeInstalled() ? undefined : PLUGIN_DIR });
+	private launch(dir: string, config: Config, src: TaskSource, goal?: string, learning = this.learning, planOnly = false): Run {
+		const o = new Orchestrator(config, src, learning, dir, { pluginDir: claudeInstalled() ? undefined : PLUGIN_DIR, planOnly });
 		const run: Run = { id: this.next++, dir, name: basename(dir), goal, o, done: undefined as never, finished: false };
 		o.on('update', () => this.emit('update'));
 		o.on('activity', (a) => this.emit('activity', run, a));

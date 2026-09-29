@@ -1,13 +1,16 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { decideTask, listStored, nextStep, Project } from '../src/store.js';
+import { decideTask, listStored, nextStep, Project, type RunRecord } from '../src/store.js';
 import { readIntent } from '../src/intent.js';
 import { MemorySource, StoreSource } from '../src/tasks.js';
+import { undo, undoRun } from '../src/worktree.js';
+import { Learning } from '../src/learn.js';
+import { DEFAULTS } from '../src/config.js';
 import { workerPrompt } from '../src/orchestrator.js';
 import { contextPack } from '../src/context.js';
 
@@ -280,4 +283,108 @@ test('goal queue: positions, no duplicates, oldest first, survives a new handle,
 	writeFileSync(join(p.dir, 'goals.json'), '{ not json');
 	assert.deepEqual(p.goals(), []);
 	assert.equal(p.enqueue('add d'), 1);
+});
+
+test('history: each finished run appends a line; read newest first, the newest 500 kept', () => {
+	const p = new Project(mkdtempSync(join(tmpdir(), 'jc-hist-')), mkdtempSync(join(tmpdir(), 'jc-hist-store-')));
+	assert.deepEqual(p.history(), [], 'no runs yet');
+	const run = (n: number): RunRecord => ({ at: new Date(Date.UTC(2026, 8, 29, 0, n)).toISOString(), minutes: n, goal: `goal ${n}`, total: 4, done: n % 5, blocked: 0, review: 0, cost: n / 10, planning: 0.1, agents: 3, stopped: false });
+	for (let n = 1; n <= 3; n++) p.recordRun(run(n));
+	assert.deepEqual(p.history().map((r) => r.goal), ['goal 3', 'goal 2', 'goal 1']);
+	writeFileSync(join(p.dir, 'runs.jsonl'), `${readFileSync(join(p.dir, 'runs.jsonl'), 'utf8')}not json\n`);
+	assert.equal(p.history().length, 3, 'a torn line is skipped, not fatal');
+	for (let n = 4; n <= 505; n++) p.recordRun(run(n));
+	const all = p.history();
+	assert.equal(all.length, 500);
+	assert.equal(all[0].goal, 'goal 505');
+	assert.equal(all.at(-1)!.goal, 'goal 6');
+});
+
+test('undo: a landed task\'s kept patch is taken back out and the task deferred; a patch that no longer reverses changes nothing', async () => {
+	const repo = mkdtempSync(join(tmpdir(), 'jc-undo-'));
+	const git = (...a: string[]) => execFileSync('git', a, { cwd: repo, encoding: 'utf8' });
+	git('init', '-q');
+	writeFileSync(join(repo, 'a.txt'), 'one\n');
+	git('-c', 'user.email=t@t', '-c', 'user.name=t', 'add', '.');
+	git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'base');
+	writeFileSync(join(repo, 'a.txt'), 'one\ntwo\n');
+	const patch = git('diff');
+	const p = new Project(repo, mkdtempSync(join(tmpdir(), 'jc-undo-store-')));
+	const [t] = p.add([{ title: 'add line two' }]);
+	const file = p.research(`patch-${t.id}-1-x`, patch);
+	p.update(t.id, (x) => x.attempts.push({ at: new Date().toISOString(), route: 'claude', ok: true, patch: file }));
+	p.setStatus(t.id, 'done');
+	const learning = new Learning({ ...DEFAULTS.learning, minSamples: 1 }, join(mkdtempSync(join(tmpdir(), 'jc-undo-l-')), 'l.json'));
+	const told: { kind: string; text: string }[] = [];
+	p.lock({ goal: 'another task' });
+	await assert.rejects(undo(p, repo, t.id), /a run is going in this project: stop it first/, 'a live run may be editing the same tree');
+	p.unlock();
+	assert.equal(readFileSync(join(repo, 'a.txt'), 'utf8'), 'one\ntwo\n');
+	assert.match(await undo(p, repo, t.id, { learning, intent: (e) => told.push(e) }), /took T-0001's changes back out.*claude marked down/);
+	assert.equal(learning.data.routes.claude.runs, 1, 'the route that did it is charged');
+	assert.equal(learning.data.routes.claude.ok, 0);
+	assert.equal(learning.kind('claude', 'FEATURE')?.runs, 1, 'and for its task type');
+	assert.deepEqual(told, [{ kind: 'dropped', text: 'add line two', project: p.meta.name }].map(({ kind, text }) => ({ kind, text, project: p.meta.name })));
+	assert.equal(readFileSync(join(repo, 'a.txt'), 'utf8'), 'one\n');
+	assert.equal(p.get(t.id)?.status, 'deferred');
+	assert.match(p.get(t.id)?.reason ?? '', /undone/);
+	await assert.rejects(undo(p, repo, t.id), /could not take T-0001's changes back out/, 'already out: git apply refuses, all or nothing');
+	assert.equal(readFileSync(join(repo, 'a.txt'), 'utf8'), 'one\n');
+	const [u] = p.add([{ title: 'never landed' }]);
+	await assert.rejects(undo(p, repo, u.id), /no landed patch kept for T-0002/);
+	await assert.rejects(undo(p, repo, 'T-0404'), /no task T-0404/);
+});
+
+test('undo run: the newest run still standing comes out newest first, then the one before; a patch that will not reverse stops it', async () => {
+	const repo = mkdtempSync(join(tmpdir(), 'jc-undorun-'));
+	const git = (...a: string[]) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: repo, encoding: 'utf8' });
+	git('init', '-q');
+	writeFileSync(join(repo, 'a.txt'), 'one\n');
+	git('add', '.');
+	git('commit', '-qm', 'base');
+	const p = new Project(repo, mkdtempSync(join(tmpdir(), 'jc-undorun-store-')));
+	const lands = (file: string, text: string) => {
+		const [t] = p.add([{ title: `write ${file}` }]);
+		writeFileSync(join(repo, file), text);
+		git('add', '-A');
+		const patch = git('diff', '--cached');
+		git('commit', '-qm', t.id);
+		const kept = p.research(`patch-${t.id}-1-x`, patch);
+		p.update(t.id, (x) => x.attempts.push({ at: new Date().toISOString(), route: 'claude', ok: true, patch: kept }));
+		p.setStatus(t.id, 'done');
+		return t.id;
+	};
+	const record = (n: number, landed: string[]) => p.recordRun({ at: new Date(Date.UTC(2026, 8, 29, 0, n)).toISOString(), minutes: 1, total: landed.length, done: landed.length, blocked: 0, review: 0, cost: 0, planning: 0, agents: 1, stopped: false, landed });
+	const read = (f: string) => (existsSync(join(repo, f)) ? readFileSync(join(repo, f), 'utf8') : undefined);
+	await assert.rejects(undoRun(p, repo), /no run here has landed tasks still in the tree/);
+	record(1, [lands('a.txt', 'one\ntwo\n')]);
+	record(2, [lands('b.txt', 'b\n'), lands('a.txt', 'one\ntwo\nthree\n')]);
+	assert.match(await undoRun(p, repo), /took the 2026-09-29 00:02 run's 2 landed tasks back out of .*, newest first: T-0003, T-0002; each is deferred/);
+	assert.deepEqual([read('a.txt'), read('b.txt')], ['one\ntwo\n', undefined]);
+	assert.match(await undoRun(p, repo), /00:01 run's 1 landed task back out.*: T-0001;/, 'again: the run before');
+	assert.equal(read('a.txt'), 'one\n');
+	assert.deepEqual(p.tasks().map((t) => t.status), ['deferred', 'deferred', 'deferred']);
+	await assert.rejects(undoRun(p, repo), /no run here has landed tasks still in the tree/);
+	record(3, [lands('c.txt', 'c\n'), lands('d.txt', 'd\n')]);
+	writeFileSync(join(repo, 'c.txt'), 'changed since\n');
+	await assert.rejects(undoRun(p, repo), /^Error: took T-0005 back out, then stopped at T-0004: could not take T-0004's changes back out \(nothing was changed\).*; T-0004 stays in the tree$/);
+	assert.deepEqual([read('c.txt'), read('d.txt'), p.get('T-0004')?.status, p.get('T-0005')?.status], ['changed since\n', undefined, 'done', 'deferred']);
+});
+
+test('find: tasks matching in any field or by a file their patch touched, case-insensitive, with where', () => {
+	const p = new Project(mkdtempSync(join(tmpdir(), 'jc-find-')), mkdtempSync(join(tmpdir(), 'jc-find-store-')));
+	const [a, b, c] = p.add([
+		{ title: 'Add the settings loader', brief: 'reads JSON', files: ['src/settings.ts'] },
+		{ title: 'Speed up startup', acs: [{ text: 'boots fast', verify: 'npm run bench' }] },
+		{ title: 'Unrelated' },
+	]);
+	const patch = p.research('patch-T-0002-1-x', 'diff --git a/src/Loader.ts b/src/Loader.ts\n@@ -1 +1 @@\n-a\n+b\n');
+	p.update(b.id, (t) => t.attempts.push({ at: new Date().toISOString(), route: 'claude', ok: true, patch, summary: 'cached the config' }));
+	p.update(c.id, (t) => (t.lessons = ['the LOADER needs a warm cache']));
+	const found = p.find('loader');
+	assert.deepEqual(found.map((f) => [f.task.id, f.where]), [[a.id, ['title']], [b.id, ['patch: src/Loader.ts']], [c.id, ['lessons']]]);
+	assert.deepEqual(p.find('settings.ts').map((f) => f.where), [['files']]);
+	assert.deepEqual(p.find('bench').map((f) => f.where), [['criteria']]);
+	assert.deepEqual(p.find('cached').map((f) => f.where), [['attempts']]);
+	assert.deepEqual(p.find('  '), [], 'blank finds nothing');
 });
